@@ -1,9 +1,9 @@
-﻿# ====================================================================
+# ====================================================================
 # scpm (PowerShell Script Profile Manager)
 # Module: scpm.psm1
 # ====================================================================
 
-$Script:ScpmVersion = "1.1.0"
+$Script:ScpmVersion = "1.2.0"
 $Script:ScpmHome = Join-Path $HOME ".scpm"
 $Script:ConfigFile = Join-Path $Script:ScpmHome "config.json"
 $Script:RegistryFile = Join-Path $Script:ScpmHome "registry.json"
@@ -84,6 +84,69 @@ function Resolve-PortablePathInternal([string]$portablePath) {
         return (Join-Path $HOME $sub)
     }
     return $portablePath
+}
+
+function Get-ScpmDisplayWidthInternal([string]$str) {
+    if ([string]::IsNullOrEmpty($str)) { return 0 }
+    $w = 0
+    foreach ($ch in $str.ToCharArray()) {
+        $cp = [int]$ch
+        if (($cp -ge 0x4E00 -and $cp -le 0x9FFF) -or
+            ($cp -ge 0x3400 -and $cp -le 0x4DBF) -or
+            ($cp -ge 0xF900 -and $cp -le 0xFAFF) -or
+            ($cp -ge 0x3000 -and $cp -le 0x303F) -or
+            ($cp -ge 0xFF01 -and $cp -le 0xFF60) -or
+            ($cp -ge 0xFFE0 -and $cp -le 0xFFE6) -or
+            ($cp -ge 0x20000 -and $cp -le 0x2A6DF)) {
+            $w += 2
+        } else {
+            $w += 1
+        }
+    }
+    return $w
+}
+
+function Truncate-ScpmDisplayStringInternal([string]$str, [int]$maxWidth) {
+    if ([string]::IsNullOrEmpty($str)) { return "" }
+    $dw = Get-ScpmDisplayWidthInternal $str
+    if ($dw -le $maxWidth) { return $str }
+    if ($maxWidth -le 3) {
+        $res = ""
+        $w = 0
+        foreach ($ch in $str.ToCharArray()) {
+            $cw = if ([int]$ch -gt 255) { 2 } else { 1 }
+            if ($w + $cw -gt $maxWidth) { break }
+            $res += $ch
+            $w += $cw
+        }
+        return $res
+    }
+    $targetWidth = $maxWidth - 3
+    $curWidth = 0
+    $sb = [System.Text.StringBuilder]::new()
+    foreach ($ch in $str.ToCharArray()) {
+        $cp = [int]$ch
+        $cw = if (($cp -ge 0x4E00 -and $cp -le 0x9FFF) -or
+            ($cp -ge 0x3400 -and $cp -le 0x4DBF) -or
+            ($cp -ge 0xF900 -and $cp -le 0xFAFF) -or
+            ($cp -ge 0x3000 -and $cp -le 0x303F) -or
+            ($cp -ge 0xFF01 -and $cp -le 0xFF60) -or
+            ($cp -ge 0xFFE0 -and $cp -le 0xFFE6) -or
+            ($cp -ge 0x20000 -and $cp -le 0x2A6DF)) { 2 } else { 1 }
+        if ($curWidth + $cw -gt $targetWidth) {
+            [void]$sb.Append("...")
+            return $sb.ToString()
+        }
+        [void]$sb.Append($ch)
+        $curWidth += $cw
+    }
+    return $sb.ToString()
+}
+
+function Pad-ScpmDisplayStringInternal([string]$str, [int]$targetWidth) {
+    $dw = Get-ScpmDisplayWidthInternal $str
+    if ($dw -ge $targetWidth) { return $str }
+    return $str + (" " * ($targetWidth - $dw))
 }
 
 function Update-ScpmLoaderInternal {
@@ -724,191 +787,838 @@ function Invoke-ScpmTui {
     }
 
     $cursor = 0
-    $statusMsg = "欢迎进入 scpm 控制台！[↑/↓] 导航，[空格] 原地启停，[q] 退出。"
+    $scrollOffset = 0
+    $searchFilter = ""
+    $inSearchMode = $false
+    $statusMsg = "欢迎进入 scpm 控制台！[↑/↓] 导航，[空格] 启停，[/] 搜索，[q] 退出。"
     $statusMsgColor = "Gray"
 
+    $esc = [char]27
     $savedCursorVisible = $true
     try {
         $savedCursorVisible = [Console]::CursorVisible
-        [Console]::CursorVisible = $false
     } catch {}
 
+    $fgMap = @{
+        "Black"       = "$esc[30m"
+        "DarkRed"     = "$esc[31m"
+        "DarkGreen"   = "$esc[32m"
+        "DarkYellow"  = "$esc[33m"
+        "DarkBlue"    = "$esc[34m"
+        "DarkMagenta" = "$esc[35m"
+        "DarkCyan"    = "$esc[36m"
+        "Gray"        = "$esc[37m"
+        "DarkGray"    = "$esc[90m"
+        "Red"         = "$esc[91m"
+        "Green"       = "$esc[92m"
+        "Yellow"      = "$esc[93m"
+        "Blue"        = "$esc[94m"
+        "Magenta"     = "$esc[95m"
+        "Cyan"        = "$esc[96m"
+        "White"       = "$esc[97m"
+    }
+
+    $bgMap = @{
+        "Black"       = "$esc[40m"
+        "DarkRed"     = "$esc[41m"
+        "DarkGreen"   = "$esc[42m"
+        "DarkYellow"  = "$esc[43m"
+        "DarkBlue"    = "$esc[44m"
+        "DarkMagenta" = "$esc[45m"
+        "DarkCyan"    = "$esc[46m"
+        "Gray"        = "$esc[47m"
+        "DarkGray"    = "$esc[100m"
+        "Cyan"        = "$esc[106m"
+        "White"       = "$esc[107m"
+    }
+
+    $reset = "$esc[0m"
+
+    function Out-Ansi {
+        param(
+            [string]$Text = "",
+            [string]$Fg = $null,
+            [string]$Bg = $null,
+            [switch]$NoNewline
+        )
+        $prefix = ""
+        if ($Fg -and $fgMap.ContainsKey($Fg)) { $prefix += $fgMap[$Fg] }
+        if ($Bg -and $bgMap.ContainsKey($Bg)) { $prefix += $bgMap[$Bg] }
+
+        $suffix = if ($prefix) { $reset } else { "" }
+        $nl = if ($NoNewline) { "" } else { "`n" }
+        [Console]::Write("$prefix$Text$suffix$nl")
+    }
+
+    # 启用备用屏幕缓冲区 (Alternate Screen Buffer) 并隐藏光标
+    # 彻底隔离终端历史滚动，防止任何画面残影和上下漂移
+    try {
+        [Console]::Write("$esc[?1049h$esc[?25l")
+    } catch {}
     Clear-Host
-    $startPos = [System.Management.Automation.Host.Coordinates]::new(0, 0)
 
     try {
         while ($true) {
-            if ($cursor -ge $items.Count) { $cursor = [Math]::Max(0, $items.Count - 1) }
-
-            $currItem = $items[$cursor]
-            $currMethodInfo = $currItem.MethodInfo
-
-            $winWidth = 84
-            try {
-                $winWidth = [Math]::Max(70, [Math]::Min(110, $Host.UI.RawUI.WindowSize.Width - 1))
-            } catch {}
-
-            $borderLine = "─" * $winWidth
-
-            # 重置光标到左上角重绘
-            try { $Host.UI.RawUI.CursorPosition = $startPos } catch {}
-
-            # --- 区域 1: 标题与统计 ---
-            $enabledCount = @($items | Where-Object { $_.Enabled }).Count
-            $disabledCount = $items.Count - $enabledCount
-            $storePathStr = if ($config) { $config.storagePath } else { "$HOME\.scpm\scripts" }
-
-            Write-Host "=== [scpm] 脚本集中管理控制台 v$Script:ScpmVersion ===".PadRight($winWidth) -ForegroundColor Cyan
-            Write-Host "存储库: $storePathStr | 总计: $($items.Count) 个脚本 (已启用: $enabledCount, 已禁用: $disabledCount)".PadRight($winWidth) -ForegroundColor DarkGray
-            Write-Host ""
-
-            # --- 区域 2: 脚本列表区 ---
-            Write-Host "[受管理脚本列表] (按空格键即时翻转启停状态)".PadRight($winWidth) -ForegroundColor Yellow
-
-            for ($i = 0; $i -lt $items.Count; $i++) {
-                $it = $items[$i]
-                $isCurrent = ($i -eq $cursor)
-
-                $ptr = if ($isCurrent) { " > " } else { "   " }
-                $pColor = if ($isCurrent) { "Yellow" } else { "DarkGray" }
-                
-                $st = if ($it.Enabled) { "[✓ 已启用]" } else { "[✗ 已禁用]" }
-                $stColor = if ($it.Enabled) { "Green" } else { "DarkGray" }
-                $nameColor = if ($isCurrent) { "Cyan" } else { "White" }
-
-                $idxStr = "[$($it.Index)]".PadRight(5)
-                $nameStr = $it.Name.PadRight(22)
-                $descStr = $it.Description
-
-                Write-Host $ptr -ForegroundColor $pColor -NoNewline
-                Write-Host $idxStr -ForegroundColor DarkGray -NoNewline
-                Write-Host " $st " -ForegroundColor $stColor -NoNewline
-                Write-Host $nameStr -ForegroundColor $nameColor -NoNewline
-
-                $usedLen = 3 + 5 + 10 + 22 + 2
-                $remLen = [Math]::Max(10, $winWidth - $usedLen)
-                $descPadded = if ($descStr.Length -gt $remLen) { $descStr.Substring(0, $remLen - 3) + "..." } else { $descStr.PadRight($remLen) }
-                Write-Host " $descPadded" -ForegroundColor Gray
+            # 过滤逻辑 (按 / 搜索过滤)
+            if ([string]::IsNullOrWhiteSpace($searchFilter)) {
+                $activeItems = $items
+            } else {
+                $activeItems = @($items | Where-Object {
+                    $_.Name -like "*$searchFilter*" -or $_.Description -like "*$searchFilter*"
+                })
             }
 
-            Write-Host ""
-            Write-Host ("─" * [Math]::Min($winWidth, 80)) -ForegroundColor DarkCyan
-
-            # --- 区域 3: 实时导出方法与用法联动预览区 ---
-            Write-Host "[实时导出方法与用法预览: $($currItem.Name)]".PadRight($winWidth) -ForegroundColor Yellow
-            Write-Host "  文件路径: $($currItem.Path)".PadRight($winWidth) -ForegroundColor DarkGray
-            
-            Write-Host "  导出方法 / 全局函数:".PadRight($winWidth) -ForegroundColor Green
-            if ($currMethodInfo.Functions.Count -eq 0) {
-                Write-Host "    • (该脚本未定义函数，作为独立脚本直接执行)".PadRight($winWidth) -ForegroundColor DarkGray
+            if ($activeItems.Count -gt 0) {
+                if ($cursor -ge $activeItems.Count) { $cursor = $activeItems.Count - 1 }
+                if ($cursor -lt 0) { $cursor = 0 }
+                $currItem = $activeItems[$cursor]
+                $currMethodInfo = $currItem.MethodInfo
             } else {
-                $shownFuncCount = 0
-                foreach ($fn in $currMethodInfo.Functions) {
-                    if (-not $fn.IsNested -and $shownFuncCount -lt 4) {
-                        Write-Host "    • " -NoNewline -ForegroundColor Cyan
-                        Write-Host "$($fn.Signature)" -ForegroundColor White
-                        if ($fn.Parameters.Count -gt 0) {
-                            foreach ($param in $fn.Parameters) {
-                                if ($param.ValidateSet.Count -gt 0) {
-                                    Write-Host "        $($param.Name) 可选值: $($param.ValidateSet -join ', ')".PadRight($winWidth) -ForegroundColor Yellow
+                $cursor = 0
+                $currItem = $null
+                $currMethodInfo = $null
+            }
+
+            # 动态获取终端尺寸，并做安全宽度与行数约束 (杜绝横向换行与纵向滚屏)
+            $winWidth = 84
+            $winHeight = 25
+            try {
+                if ($Host.UI.RawUI.WindowSize.Width -gt 0) {
+                    $winWidth = $Host.UI.RawUI.WindowSize.Width
+                }
+                if ($Host.UI.RawUI.WindowSize.Height -gt 0) {
+                    $winHeight = $Host.UI.RawUI.WindowSize.Height
+                }
+            } catch {}
+
+            $isWide = ($winWidth -ge 100)
+            $storePathStr = if ($config) { $config.storagePath } else { "$HOME\.scpm\scripts" }
+            $enabledCount = @($items | Where-Object { $_.Enabled }).Count
+
+            # 重置光标至视口左上角 (1, 1)
+            [Console]::Write("$esc[1;1H")
+            try { [Console]::SetCursorPosition(0, 0) } catch {}
+
+            # 通用单元格输出组件 (严格限制输出宽度与色彩)
+            function Write-PanelCellInternal {
+                param(
+                    [object]$cell,
+                    [int]$cellInnerWidth,
+                    [string]$borderColor = "DarkCyan"
+                )
+
+                Out-Ansi "│ " -Fg $borderColor -NoNewline
+
+                if ($null -eq $cell -or $cell.Type -eq 'Empty') {
+                    [Console]::Write(" " * $cellInnerWidth)
+                } elseif ($cell.Type -eq 'Full') {
+                    $truncated = Truncate-ScpmDisplayStringInternal $cell.Text $cellInnerWidth
+                    $padded = Pad-ScpmDisplayStringInternal $truncated $cellInnerWidth
+                    Out-Ansi $padded -Fg $cell.Fg -Bg $cell.Bg -NoNewline
+                } elseif ($cell.Type -eq 'Segments') {
+                    $remW = $cellInnerWidth
+                    foreach ($seg in $cell.Segments) {
+                        if ($remW -le 0) { break }
+                        $sw = Get-ScpmDisplayWidthInternal $seg.Text
+                        $color = if ($seg.Fg) { $seg.Fg } else { $seg.Color }
+                        $bg = if ($seg.Bg) { $seg.Bg } else { $null }
+                        if ($sw -le $remW) {
+                            Out-Ansi $seg.Text -Fg $color -Bg $bg -NoNewline
+                            $remW -= $sw
+                        } else {
+                            $tr = Truncate-ScpmDisplayStringInternal $seg.Text $remW
+                            Out-Ansi $tr -Fg $color -Bg $bg -NoNewline
+                            $remW -= (Get-ScpmDisplayWidthInternal $tr)
+                        }
+                    }
+                    if ($remW -gt 0) {
+                        [Console]::Write(" " * $remW)
+                    }
+                }
+
+                Out-Ansi " │" -Fg $borderColor -NoNewline
+            }
+
+            if ($isWide) {
+                # ============================================================
+                # 模式 A: 响应式宽屏双栏布局 (Side-by-Side Dual Panels)
+                # ============================================================
+                $totalW = [Math]::Max(70, $winWidth - 2)
+                # 左栏宽度在宽屏下自适应扩展（占约 36%），最小 38，最大可达 75 列
+                $leftW = [Math]::Max(38, [Math]::Min(75, [int]($totalW * 0.36)))
+                $rightW = $totalW - $leftW - 1
+                $leftInner = $leftW - 4
+                $rightInner = $rightW - 4
+                # 内容区域撑满终端视口高度（预留顶边框1行、底边框1行、快捷键1行、状态栏1行与安全裕量）
+                $contentLines = [Math]::Max(8, $winHeight - 5)
+
+                # --- 1. 构建左侧脚本列表行数据 ---
+                $leftRows = [System.Collections.Generic.List[object]]::new()
+                
+                # 行 0: 存储库信息或搜索提示
+                if (-not [string]::IsNullOrWhiteSpace($searchFilter)) {
+                    $leftRows.Add([PSCustomObject]@{
+                        Type = 'Segments'
+                        Segments = @(
+                            @{ Text = "搜索匹配: "; Fg = "DarkGray" },
+                            @{ Text = "$($activeItems.Count) 项 (共 $($items.Count) 项)"; Fg = "Yellow" }
+                        )
+                    })
+                } else {
+                    $leftRows.Add([PSCustomObject]@{
+                        Type = 'Segments'
+                        Segments = @(
+                            @{ Text = "存储: "; Fg = "DarkGray" },
+                            @{ Text = (Truncate-ScpmDisplayStringInternal $storePathStr ($leftInner - 6)); Fg = "Cyan" }
+                        )
+                    })
+                }
+
+                $visibleListCount = $contentLines - 1
+                if ($cursor -lt $scrollOffset) {
+                    $scrollOffset = $cursor
+                } elseif ($cursor -ge ($scrollOffset + $visibleListCount)) {
+                    $scrollOffset = $cursor - $visibleListCount + 1
+                }
+                $scrollOffset = [Math]::Max(0, [Math]::Min($scrollOffset, [Math]::Max(0, $activeItems.Count - $visibleListCount)))
+
+                # 动态计算当前活动脚本中最长名称，弹性调整名称列宽 (14 ~ 26 字符)
+                $maxNameW = 14
+                foreach ($ai in $activeItems) {
+                    $w = Get-ScpmDisplayWidthInternal $ai.Name
+                    if ($w -gt $maxNameW) { $maxNameW = $w }
+                }
+                $nameColW = [Math]::Min(26, [Math]::Max(14, $maxNameW))
+
+                if ($activeItems.Count -eq 0) {
+                    $leftRows.Add([PSCustomObject]@{
+                        Type = 'Segments'
+                        Segments = @(
+                            @{ Text = "  未找到与 `"$searchFilter`" 匹配的脚本"; Fg = "Yellow" }
+                        )
+                    })
+                    $leftRows.Add([PSCustomObject]@{
+                        Type = 'Segments'
+                        Segments = @(
+                            @{ Text = "  (按 Esc 清除过滤，或按退格修改)"; Fg = "DarkGray" }
+                        )
+                    })
+                } else {
+                    $endIdx = [Math]::Min($activeItems.Count, $scrollOffset + $visibleListCount)
+                    for ($i = $scrollOffset; $i -lt $endIdx; $i++) {
+                        $it = $activeItems[$i]
+                        $isCurrent = ($i -eq $cursor)
+
+                        $ptr = if ($isCurrent) { " ❯ " } else { "   " }
+                        $idxStr = "[$($it.Index)] "
+                        $stStr = if ($it.Enabled) { "[●] " } else { "[○] " }
+                        
+                        $prefix = "$ptr$idxStr$stStr"
+                        $prefixW = Get-ScpmDisplayWidthInternal $prefix
+                        $nameStr = Pad-ScpmDisplayStringInternal (Truncate-ScpmDisplayStringInternal $it.Name $nameColW) $nameColW
+                        $descMaxW = [Math]::Max(4, $leftInner - $prefixW - $nameColW - 1)
+                        $descStr = Truncate-ScpmDisplayStringInternal $it.Description $descMaxW
+
+                        if ($isCurrent) {
+                            # 选中项：高亮青底纯黑字 (高对比度)
+                            $fullRow = "$prefix$nameStr $descStr"
+                            $leftRows.Add([PSCustomObject]@{
+                                Type = 'Full'
+                                Text = $fullRow
+                                Fg = 'Black'
+                                Bg = 'Cyan'
+                            })
+                        } else {
+                            $stColor = if ($it.Enabled) { "Green" } else { "DarkGray" }
+                            $leftRows.Add([PSCustomObject]@{
+                                Type = 'Segments'
+                                Segments = @(
+                                    @{ Text = $ptr; Fg = "DarkGray" },
+                                    @{ Text = $idxStr; Fg = "DarkGray" },
+                                    @{ Text = $stStr; Fg = $stColor },
+                                    @{ Text = $nameStr; Fg = "Cyan" },
+                                    @{ Text = " $descStr"; Fg = "Gray" }
+                                )
+                            })
+                        }
+                    }
+                }
+
+                while ($leftRows.Count -lt $contentLines) {
+                    $leftRows.Add([PSCustomObject]@{ Type = 'Empty' })
+                }
+
+                # --- 2. 构建右侧详细信息与方法预览行数据 ---
+                $rightRows = [System.Collections.Generic.List[object]]::new()
+                if ($null -ne $currItem) {
+                    $mInfo = $currMethodInfo
+
+                    # 路径行
+                    $fStatus = if ($currItem.FileExists) { " [文件正常]" } else { " [文件缺失]" }
+                    $fColor = if ($currItem.FileExists) { "Green" } else { "Red" }
+                    $rightRows.Add([PSCustomObject]@{
+                        Type = 'Segments'
+                        Segments = @(
+                            @{ Text = "文件路径: "; Fg = "DarkGray" },
+                            @{ Text = (Truncate-ScpmDisplayStringInternal $currItem.Path ($rightInner - 22)); Fg = "Gray" },
+                            @{ Text = $fStatus; Fg = $fColor }
+                        )
+                    })
+
+                    # 描述行
+                    $rightRows.Add([PSCustomObject]@{
+                        Type = 'Segments'
+                        Segments = @(
+                            @{ Text = "功能说明: "; Fg = "DarkGray" },
+                            @{ Text = (Truncate-ScpmDisplayStringInternal $currItem.Description ($rightInner - 11)); Fg = "White" }
+                        )
+                    })
+
+                    # 方法与函数
+                    $rightRows.Add([PSCustomObject]@{
+                        Type = 'Segments'
+                        Segments = @(
+                            @{ Text = "⚙ 导出方法 / 全局函数 ($($mInfo.Functions.Count)):"; Fg = "Cyan" }
+                        )
+                    })
+
+                    if ($mInfo.Functions.Count -eq 0) {
+                        $rightRows.Add([PSCustomObject]@{
+                            Type = 'Segments'
+                            Segments = @(
+                                @{ Text = "  • (该脚本未定义全局函数，作为独立脚本直接执行)"; Fg = "DarkGray" }
+                            )
+                        })
+                    } else {
+                        foreach ($fn in $mInfo.Functions) {
+                            if ($rightRows.Count -ge ($contentLines - 5)) { break }
+                            $rightRows.Add([PSCustomObject]@{
+                                Type = 'Segments'
+                                Segments = @(
+                                    @{ Text = "  • "; Fg = "Cyan" },
+                                    @{ Text = (Truncate-ScpmDisplayStringInternal $fn.Signature ($rightInner - 6)); Fg = "White" }
+                                )
+                            })
+                            foreach ($p in $fn.Parameters) {
+                                if ($rightRows.Count -ge ($contentLines - 5)) { break }
+                                if ($p.ValidateSet -and $p.ValidateSet.Count -gt 0) {
+                                    $opts = ($p.ValidateSet | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join ', '
+                                    if (-not [string]::IsNullOrWhiteSpace($opts)) {
+                                        $rightRows.Add([PSCustomObject]@{
+                                            Type = 'Segments'
+                                            Segments = @(
+                                                @{ Text = "      $($p.Name) 可选值: "; Fg = "DarkGray" },
+                                                @{ Text = (Truncate-ScpmDisplayStringInternal $opts ($rightInner - 20)); Fg = "Yellow" }
+                                            )
+                                        })
+                                    }
                                 }
                             }
                         }
-                        $shownFuncCount++
+                    }
+
+                    # 用法示例
+                    if (-not [string]::IsNullOrWhiteSpace($mInfo.Usage) -and ($rightRows.Count -lt ($contentLines - 2))) {
+                        $rightRows.Add([PSCustomObject]@{
+                            Type = 'Segments'
+                            Segments = @(
+                                @{ Text = "📖 用法示例 (USAGE):"; Fg = "Cyan" }
+                            )
+                        })
+                        $uLines = $mInfo.Usage -split '\r?\n'
+                        foreach ($ul in $uLines) {
+                            if ($rightRows.Count -ge $contentLines) { break }
+                            if (-not [string]::IsNullOrWhiteSpace($ul)) {
+                                $rightRows.Add([PSCustomObject]@{
+                                    Type = 'Segments'
+                                    Segments = @(
+                                        @{ Text = "  $(Truncate-ScpmDisplayStringInternal ($ul.Trim()) ($rightInner - 4))"; Fg = "Gray" }
+                                    )
+                                })
+                            }
+                        }
+                    } elseif (-not [string]::IsNullOrWhiteSpace($mInfo.Description) -and ($rightRows.Count -lt ($contentLines - 2))) {
+                        $rightRows.Add([PSCustomObject]@{
+                            Type = 'Segments'
+                            Segments = @(
+                                @{ Text = "📖 详细说明:"; Fg = "Cyan" }
+                            )
+                        })
+                        $dLines = $mInfo.Description -split '\r?\n'
+                        foreach ($dl in $dLines) {
+                            if ($rightRows.Count -ge $contentLines) { break }
+                            if (-not [string]::IsNullOrWhiteSpace($dl)) {
+                                $rightRows.Add([PSCustomObject]@{
+                                    Type = 'Segments'
+                                    Segments = @(
+                                        @{ Text = "  $(Truncate-ScpmDisplayStringInternal ($dl.Trim()) ($rightInner - 4))"; Fg = "Gray" }
+                                    )
+                                })
+                            }
+                        }
+                    }
+                } else {
+                    $rightRows.Add([PSCustomObject]@{
+                        Type = 'Segments'
+                        Segments = @(
+                            @{ Text = "(暂无选中的脚本)"; Fg = "DarkGray" }
+                        )
+                    })
+                }
+
+                while ($rightRows.Count -lt $contentLines) {
+                    $rightRows.Add([PSCustomObject]@{ Type = 'Empty' })
+                }
+
+                # --- 3. 渲染左右顶边框 ---
+                $lTitle = if (-not [string]::IsNullOrWhiteSpace($searchFilter)) { "🔍 搜索: `"$searchFilter`"" } else { "受管理脚本列表" }
+                $lBadge = if (-not [string]::IsNullOrWhiteSpace($searchFilter)) { "[$($activeItems.Count)/$($items.Count)]" } else { "[$($items.Count)脚本]" }
+                $lTitleW = Get-ScpmDisplayWidthInternal $lTitle
+                $lBadgeW = Get-ScpmDisplayWidthInternal $lBadge
+                $lFillW = [Math]::Max(2, $leftW - (7 + $lTitleW + $lBadgeW))
+
+                $rTitle = if ($null -ne $currItem) { "⚡ 详情与方法: $($currItem.Name)" } else { "⚡ 详情预览" }
+                $rBadge = if ($null -ne $currItem) { if ($currItem.Enabled) { "[●已启用]" } else { "[○已禁用]" } } else { "[--]" }
+                $rTitleW = Get-ScpmDisplayWidthInternal $rTitle
+                $rBadgeW = Get-ScpmDisplayWidthInternal $rBadge
+                $rFillW = [Math]::Max(2, $rightW - (7 + $rTitleW + $rBadgeW))
+
+                # 左卡片顶边
+                Out-Ansi "╭─ " -Fg "DarkCyan" -NoNewline
+                Out-Ansi $lTitle -Fg "Cyan" -NoNewline
+                Out-Ansi (" " + ("─" * $lFillW) + " ") -Fg "DarkCyan" -NoNewline
+                Out-Ansi $lBadge -Fg "Green" -NoNewline
+                Out-Ansi " ─╮ " -Fg "DarkCyan" -NoNewline
+
+                # 右卡片顶边
+                Out-Ansi "╭─ " -Fg "DarkCyan" -NoNewline
+                Out-Ansi $rTitle -Fg "Yellow" -NoNewline
+                Out-Ansi (" " + ("─" * $rFillW) + " ") -Fg "DarkCyan" -NoNewline
+                $rColor = if ($null -ne $currItem -and $currItem.Enabled) { "Green" } else { "DarkGray" }
+                Out-Ansi $rBadge -Fg $rColor -NoNewline
+                Out-Ansi " ─╮" -Fg "DarkCyan" -NoNewline
+                [Console]::Write("$esc[K`n")
+
+                # --- 4. 逐行并排输出双栏内容 ---
+                for ($r = 0; $r -lt $contentLines; $r++) {
+                    Write-PanelCellInternal $leftRows[$r] $leftInner "DarkCyan"
+                    [Console]::Write(" ")
+                    Write-PanelCellInternal $rightRows[$r] $rightInner "DarkCyan"
+                    [Console]::Write("$esc[K`n")
+                }
+
+                # --- 5. 渲染左右底边框 ---
+                Out-Ansi ("╰" + ("─" * ($leftW - 2)) + "╯ ") -Fg "DarkCyan" -NoNewline
+                Out-Ansi ("╰" + ("─" * ($rightW - 2)) + "╯") -Fg "DarkCyan" -NoNewline
+                [Console]::Write("$esc[K`n")
+
+            } else {
+                # ============================================================
+                # 模式 B: 紧凑堆叠模式 (Stacked Mode, 终端宽度 < 100)
+                # ============================================================
+                $cardWidth = [Math]::Max(40, $winWidth - 2)
+                $innerWidth = $cardWidth - 4
+                $maxLines = [Math]::Max(14, $winHeight - 4)
+                $ctx = [PSCustomObject]@{ lines = 0 }
+
+                function Out-CardInnerLine([string]$text = "", [string]$color = "White", [string]$bg = $null) {
+                    if ($ctx.lines -ge ($maxLines - 3)) { return }
+                    $t = Pad-ScpmDisplayStringInternal (Truncate-ScpmDisplayStringInternal $text $innerWidth) $innerWidth
+                    Out-Ansi "│ " -Fg "DarkCyan" -NoNewline
+                    Out-Ansi $t -Fg $color -Bg $bg -NoNewline
+                    Out-Ansi " │" -Fg "DarkCyan" -NoNewline
+                    [Console]::Write("$esc[K`n")
+                    $ctx.lines++
+                }
+
+                function Out-CardMultiLine([array]$segments) {
+                    if ($ctx.lines -ge ($maxLines - 3)) { return }
+                    $totW = 0
+                    foreach ($seg in $segments) { $totW += Get-ScpmDisplayWidthInternal $seg.Text }
+                    Out-Ansi "│ " -Fg "DarkCyan" -NoNewline
+                    if ($totW -gt $innerWidth) {
+                        $remW = $innerWidth
+                        foreach ($seg in $segments) {
+                            if ($remW -le 0) { break }
+                            $segW = Get-ScpmDisplayWidthInternal $seg.Text
+                            $color = if ($seg.Fg) { $seg.Fg } else { $seg.Color }
+                            $bg = if ($seg.Bg) { $seg.Bg } else { $null }
+                            if ($segW -le $remW) {
+                                Out-Ansi $seg.Text -Fg $color -Bg $bg -NoNewline
+                                $remW -= $segW
+                            } else {
+                                $trunc = Truncate-ScpmDisplayStringInternal $seg.Text $remW
+                                Out-Ansi $trunc -Fg $color -Bg $bg -NoNewline
+                                $remW -= (Get-ScpmDisplayWidthInternal $trunc)
+                            }
+                        }
+                        if ($remW -gt 0) { [Console]::Write(" " * $remW) }
+                    } else {
+                        foreach ($seg in $segments) {
+                            $color = if ($seg.Fg) { $seg.Fg } else { $seg.Color }
+                            $bg = if ($seg.Bg) { $seg.Bg } else { $null }
+                            Out-Ansi $seg.Text -Fg $color -Bg $bg -NoNewline
+                        }
+                        $remW = $innerWidth - $totW
+                        if ($remW -gt 0) { [Console]::Write(" " * $remW) }
+                    }
+                    Out-Ansi " │" -Fg "DarkCyan" -NoNewline
+                    [Console]::Write("$esc[K`n")
+                    $ctx.lines++
+                }
+
+                # 上卡片 [脚本列表]
+                $title = if (-not [string]::IsNullOrWhiteSpace($searchFilter)) { "🔍 搜索: `"$searchFilter`"" } else { "[scpm] 脚本集中管理控制台 v$Script:ScpmVersion" }
+                $badge = if (-not [string]::IsNullOrWhiteSpace($searchFilter)) { "[ 匹配 $($activeItems.Count) / 共 $($items.Count) ]" } else { "[ $($items.Count) 脚本 | $enabledCount 启用 ]" }
+                $titleW = Get-ScpmDisplayWidthInternal $title
+                $badgeW = Get-ScpmDisplayWidthInternal $badge
+                $fillW = [Math]::Max(2, $cardWidth - (7 + $titleW + $badgeW))
+
+                Out-Ansi "╭─ " -Fg "DarkCyan" -NoNewline
+                Out-Ansi $title -Fg "Cyan" -NoNewline
+                Out-Ansi (" " + ("─" * $fillW) + " ") -Fg "DarkCyan" -NoNewline
+                Out-Ansi $badge -Fg "Green" -NoNewline
+                Out-Ansi " ─╮" -Fg "DarkCyan" -NoNewline
+                [Console]::Write("$esc[K`n")
+                $ctx.lines++
+
+                Out-CardMultiLine @(
+                    @{ Text = "存储库: "; Color = "DarkGray" },
+                    @{ Text = $storePathStr; Color = "Cyan" }
+                )
+
+                $visibleListCount = [Math]::Min($activeItems.Count, [Math]::Max(2, [Math]::Min(6, [int]($winHeight * 0.28))))
+                if ($cursor -lt $scrollOffset) {
+                    $scrollOffset = $cursor
+                } elseif ($cursor -ge ($scrollOffset + $visibleListCount)) {
+                    $scrollOffset = $cursor - $visibleListCount + 1
+                }
+                $scrollOffset = [Math]::Max(0, [Math]::Min($scrollOffset, [Math]::Max(0, $activeItems.Count - $visibleListCount)))
+
+                if ($activeItems.Count -eq 0) {
+                    Out-CardInnerLine "  未找到与 `"$searchFilter`" 匹配的脚本 (按 Esc 清除过滤)" "Yellow"
+                } else {
+                    $endIndex = [Math]::Min($activeItems.Count, $scrollOffset + $visibleListCount)
+                    for ($i = $scrollOffset; $i -lt $endIndex; $i++) {
+                        if ($ctx.lines -ge ($maxLines - 3)) { break }
+                        $it = $activeItems[$i]
+                        $isCurrent = ($i -eq $cursor)
+
+                        $ptr = if ($isCurrent) { " ❯ " } else { "   " }
+                        $idxStr = "[$($it.Index)] "
+                        $st = if ($it.Enabled) { "[● 已启用] " } else { "[○ 已禁用] " }
+                        $stColor = if ($it.Enabled) { "Green" } else { "DarkGray" }
+                        
+                        $nameW = 18
+                        $nameStr = Pad-ScpmDisplayStringInternal (Truncate-ScpmDisplayStringInternal $it.Name $nameW) $nameW
+
+                        $usedW = 3 + 4 + 11 + $nameW
+                        $remW = [Math]::Max(10, $innerWidth - $usedW)
+                        $descPadded = Pad-ScpmDisplayStringInternal (Truncate-ScpmDisplayStringInternal $it.Description $remW) $remW
+
+                        if ($isCurrent) {
+                            # 选中项：高对比度青底纯黑字
+                            $rowContent = Pad-ScpmDisplayStringInternal (Truncate-ScpmDisplayStringInternal "$ptr$idxStr$st$nameStr$descPadded" $innerWidth) $innerWidth
+                            Out-CardInnerLine $rowContent "Black" "Cyan"
+                        } else {
+                            Out-Ansi "│ " -Fg "DarkCyan" -NoNewline
+                            Out-Ansi $ptr -Fg "DarkGray" -NoNewline
+                            Out-Ansi $idxStr -Fg "DarkGray" -NoNewline
+                            Out-Ansi $st -Fg $stColor -NoNewline
+                            Out-Ansi $nameStr -Fg "Cyan" -NoNewline
+                            Out-Ansi $descPadded -Fg "Gray" -NoNewline
+                            Out-Ansi " │" -Fg "DarkCyan" -NoNewline
+                            [Console]::Write("$esc[K`n")
+                            $ctx.lines++
+                        }
                     }
                 }
-                $nested = @($currMethodInfo.Functions | Where-Object { $_.IsNested })
-                if ($nested.Count -gt 0) {
-                    $nestedNames = ($nested | ForEach-Object { $_.Name }) -join ", "
-                    Write-Host "    (内部辅助函数: $nestedNames)".PadRight($winWidth) -ForegroundColor DarkGray
+
+                Out-Ansi ("╰" + ("─" * ($cardWidth - 2)) + "╯") -Fg "DarkCyan" -NoNewline
+                [Console]::Write("$esc[K`n")
+                $ctx.lines++
+
+                # 下卡片 [方法与文档联动预览]
+                if ($null -ne $currItem) {
+                    $bTitle = "⚡ 实时方法与用法预览: $($currItem.Name)"
+                    $bTitleW = Get-ScpmDisplayWidthInternal $bTitle
+                    $bFillW = [Math]::Max(2, $cardWidth - (4 + $bTitleW + 3))
+
+                    Out-Ansi "╭─ " -Fg "DarkCyan" -NoNewline
+                    Out-Ansi $bTitle -Fg "Yellow" -NoNewline
+                    Out-Ansi (" " + ("─" * $bFillW) + "─╮") -Fg "DarkCyan" -NoNewline
+                    [Console]::Write("$esc[K`n")
+                    $ctx.lines++
+
+                    Out-CardMultiLine @(
+                        @{ Text = "文件路径: "; Color = "DarkGray" },
+                        @{ Text = $currItem.Path; Color = "Gray" }
+                    )
+
+                    Out-CardInnerLine "⚙ 导出方法 / 全局函数:" "Cyan"
+                    if ($currMethodInfo.Functions.Count -eq 0) {
+                        Out-CardInnerLine "  • (该脚本未定义全局函数，作为独立脚本直接执行)" "DarkGray"
+                    } else {
+                        $shownFuncCount = 0
+                        foreach ($fn in $currMethodInfo.Functions) {
+                            if ($ctx.lines -ge ($maxLines - 4)) { break }
+                            if (-not $fn.IsNested -and $shownFuncCount -lt 3) {
+                                Out-CardMultiLine @(
+                                    @{ Text = "  • "; Color = "Cyan" },
+                                    @{ Text = $fn.Signature; Color = "White" }
+                                )
+                                if ($fn.Parameters.Count -gt 0) {
+                                    foreach ($param in $fn.Parameters) {
+                                        if ($ctx.lines -ge ($maxLines - 4)) { break }
+                                        if ($param.ValidateSet -and $param.ValidateSet.Count -gt 0) {
+                                            $opts = ($param.ValidateSet | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join ', '
+                                            if (-not [string]::IsNullOrWhiteSpace($opts)) {
+                                                Out-CardMultiLine @(
+                                                    @{ Text = "      $($param.Name) 可选值: "; Color = "DarkGray" },
+                                                    @{ Text = $opts; Color = "Yellow" }
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                                $shownFuncCount++
+                            }
+                        }
+                    }
+
+                    if (-not [string]::IsNullOrWhiteSpace($currMethodInfo.Usage) -and ($ctx.lines -lt ($maxLines - 4))) {
+                        Out-CardInnerLine "📖 用法说明 (USAGE):" "Cyan"
+                        $uLines = $currMethodInfo.Usage -split '\r?\n'
+                        $shownUsage = 0
+                        foreach ($ul in $uLines) {
+                            if ($ctx.lines -ge ($maxLines - 4) -or $shownUsage -ge 3) { break }
+                            if (-not [string]::IsNullOrWhiteSpace($ul)) {
+                                Out-CardInnerLine "  $($ul.Trim())" "Gray"
+                                $shownUsage++
+                            }
+                        }
+                    }
+
+                    Out-Ansi ("╰" + ("─" * ($cardWidth - 2)) + "╯") -Fg "DarkCyan" -NoNewline
+                    [Console]::Write("$esc[K`n")
+                    $ctx.lines++
                 }
             }
 
-            if (-not [string]::IsNullOrWhiteSpace($currMethodInfo.Usage)) {
-                Write-Host "  用法示例 (USAGE):".PadRight($winWidth) -ForegroundColor Green
-                $uLines = $currMethodInfo.Usage -split '\r?\n'
-                $shownUsage = 0
-                foreach ($ul in $uLines) {
-                    if (-not [string]::IsNullOrWhiteSpace($ul) -and $shownUsage -lt 4) {
-                        $ulText = "    " + $ul.Trim()
-                        Write-Host $ulText.PadRight($winWidth) -ForegroundColor Gray
-                        $shownUsage++
-                    }
-                }
-            } elseif (-not [string]::IsNullOrWhiteSpace($currMethodInfo.Description)) {
-                Write-Host "  详细说明:".PadRight($winWidth) -ForegroundColor Green
-                $dLines = $currMethodInfo.Description -split '\r?\n'
-                $shownDesc = 0
-                foreach ($dl in $dLines) {
-                    if (-not [string]::IsNullOrWhiteSpace($dl) -and $shownDesc -lt 3) {
-                        Write-Host ("    " + $dl.Trim()).PadRight($winWidth) -ForegroundColor Gray
-                        $shownDesc++
-                    }
+            # --- 区域 3: 底部快捷键与状态条 ---
+            Out-Ansi " 快捷键: " -Fg "DarkCyan" -NoNewline
+            Out-Ansi "[↑/↓]" -Fg "Yellow" -NoNewline
+            Out-Ansi "移动 " -Fg "DarkGray" -NoNewline
+            Out-Ansi "[空格]" -Fg "Yellow" -NoNewline
+            Out-Ansi "启停 " -Fg "DarkGray" -NoNewline
+            Out-Ansi "[/]" -Fg "Yellow" -NoNewline
+            Out-Ansi "搜索 " -Fg "DarkGray" -NoNewline
+            Out-Ansi "[e]" -Fg "Cyan" -NoNewline
+            Out-Ansi "编辑 " -Fg "DarkGray" -NoNewline
+            Out-Ansi "[n]" -Fg "Cyan" -NoNewline
+            Out-Ansi "新建 " -Fg "DarkGray" -NoNewline
+            Out-Ansi "[s]" -Fg "Cyan" -NoNewline
+            Out-Ansi "同步 " -Fg "DarkGray" -NoNewline
+            Out-Ansi "[r]" -Fg "Red" -NoNewline
+            Out-Ansi "注销 " -Fg "DarkGray" -NoNewline
+            Out-Ansi "[q]" -Fg "Gray" -NoNewline
+            Out-Ansi "退出" -Fg "DarkGray" -NoNewline
+            [Console]::Write("$esc[K`n")
+
+            if ($inSearchMode) {
+                Out-Ansi " 🔍 搜索: " -Fg "Yellow" -NoNewline
+                Out-Ansi "$searchFilter" -Fg "White" -NoNewline
+                Out-Ansi "█" -Fg "Yellow" -NoNewline
+                Out-Ansi " (回车锁定，Esc退出，↑/↓选择，空格启停)" -Fg "DarkGray" -NoNewline
+                [Console]::Write("$esc[K")
+            } elseif (-not [string]::IsNullOrWhiteSpace($searchFilter)) {
+                Out-Ansi " [过滤中: `"$searchFilter`"] " -Fg "Yellow" -NoNewline
+                Out-Ansi "(按 Esc 清除过滤) | 状态: " -Fg "DarkGray" -NoNewline
+                Out-Ansi $statusMsg -Fg $statusMsgColor -NoNewline
+                [Console]::Write("$esc[K")
+            } else {
+                Out-Ansi " 状态提示: " -Fg "DarkGray" -NoNewline
+                Out-Ansi $statusMsg -Fg $statusMsgColor -NoNewline
+                [Console]::Write("$esc[K")
+            }
+
+            # 清除视口底部可能残留的历史行
+            [Console]::Write("$esc[J")
+
+            # --- 键盘事件监听与实时窗口尺寸自适应检测 ---
+            $resized = $false
+            while (-not [Console]::KeyAvailable) {
+                Start-Sleep -Milliseconds 40
+                $curW = 84
+                $curH = 25
+                try {
+                    if ($Host.UI.RawUI.WindowSize.Width -gt 0) { $curW = $Host.UI.RawUI.WindowSize.Width }
+                    if ($Host.UI.RawUI.WindowSize.Height -gt 0) { $curH = $Host.UI.RawUI.WindowSize.Height }
+                } catch {}
+
+                if ($curW -ne $winWidth -or $curH -ne $winHeight) {
+                    $resized = $true
+                    [Console]::Write("$esc[2J$esc[1;1H")
+                    break
                 }
             }
 
-            Write-Host ("─" * [Math]::Min($winWidth, 80)) -ForegroundColor DarkCyan
-
-            # --- 区域 4: 底部快捷键提示与状态条 ---
-            Write-Host "快捷键: [↑/↓] 移动 | [空格] 启停切换 | [e] 编辑 | [n] 新建 | [s] 同步 | [r] 移除 | [q] 退出".PadRight($winWidth) -ForegroundColor DarkGray
-            Write-Host "状态提示: $statusMsg".PadRight($winWidth) -ForegroundColor $statusMsgColor
-
-            # 清除可能残留的多余行
-            for ($k = 0; $k -lt 3; $k++) {
-                Write-Host (" " * $winWidth)
+            if ($resized) {
+                continue
             }
-            try { $Host.UI.RawUI.CursorPosition = [System.Management.Automation.Host.Coordinates]::new(0, $Host.UI.RawUI.CursorPosition.Y - 3) } catch {}
 
-            # --- 键盘事件监听 ---
             $key = [Console]::ReadKey($true)
-            switch ($key.Key) {
-                ([ConsoleKey]::UpArrow) {
-                    $cursor = ($cursor - 1 + $items.Count) % $items.Count
-                }
-                ([ConsoleKey]::DownArrow) {
-                    $cursor = ($cursor + 1) % $items.Count
-                }
-                ([ConsoleKey]::Spacebar) {
-                    $it = $items[$cursor]
-                    $it.Enabled = -not $it.Enabled
-                    $reg.scripts.PSObject.Properties[$it.Name].Value.enabled = $it.Enabled
-                    Save-ScpmRegistryInternal $reg
-                    Update-ScpmLoaderInternal | Out-Null
 
-                    if ($it.Enabled) {
-                        if (Test-Path -LiteralPath $it.RealPath) {
-                            try {
-                                . $it.RealPath
-                                $statusMsg = "[✓] 已启用 $($it.Name) 并即时载入当前终端！"
-                                $statusMsgColor = "Green"
-                            } catch {
-                                $statusMsg = "[✓] 已启用 $($it.Name) (载入告警: $($_.Exception.Message))"
+            if ($inSearchMode) {
+                switch ($key.Key) {
+                    ([ConsoleKey]::Escape) {
+                        $inSearchMode = $false
+                        $searchFilter = ""
+                        $cursor = 0
+                        $statusMsg = "已退出搜索模式。"
+                        $statusMsgColor = "Gray"
+                    }
+                    ([ConsoleKey]::Enter) {
+                        $inSearchMode = $false
+                        $statusMsg = if ($searchFilter) { "已锁定过滤: `"$searchFilter`" (按 Esc 清除)。" } else { "就绪。" }
+                        $statusMsgColor = "Cyan"
+                    }
+                    ([ConsoleKey]::Backspace) {
+                        if ($searchFilter.Length -gt 0) {
+                            $searchFilter = $searchFilter.Substring(0, $searchFilter.Length - 1)
+                            $cursor = 0
+                            $scrollOffset = 0
+                        } else {
+                            $inSearchMode = $false
+                        }
+                    }
+                    ([ConsoleKey]::UpArrow) {
+                        if ($activeItems.Count -gt 0) {
+                            $cursor = ($cursor - 1 + $activeItems.Count) % $activeItems.Count
+                        }
+                    }
+                    ([ConsoleKey]::DownArrow) {
+                        if ($activeItems.Count -gt 0) {
+                            $cursor = ($cursor + 1) % $activeItems.Count
+                        }
+                    }
+                    ([ConsoleKey]::Spacebar) {
+                        if ($null -ne $currItem) {
+                            $currItem.Enabled = -not $currItem.Enabled
+                            $reg.scripts.PSObject.Properties[$currItem.Name].Value.enabled = $currItem.Enabled
+                            Save-ScpmRegistryInternal $reg
+                            Update-ScpmLoaderInternal | Out-Null
+                            if ($currItem.Enabled) {
+                                if (Test-Path -LiteralPath $currItem.RealPath) {
+                                    try {
+                                        & { . $currItem.RealPath } *>$null
+                                        $statusMsg = "[✓] 已启用 $($currItem.Name)！"
+                                        $statusMsgColor = "Green"
+                                    } catch {
+                                        $statusMsg = "[✓] 已启用 $($currItem.Name) (载入告警)"
+                                        $statusMsgColor = "Yellow"
+                                    }
+                                }
+                            } else {
+                                $statusMsg = "[✗] 已禁用 $($currItem.Name)。"
                                 $statusMsgColor = "Yellow"
                             }
                         }
-                    } else {
-                        $statusMsg = "[✗] 已禁用 $($it.Name) (新开终端将不再载入)。"
-                        $statusMsgColor = "Yellow"
+                    }
+                    default {
+                        if (-not [char]::IsControl($key.KeyChar)) {
+                            $searchFilter += $key.KeyChar
+                            $cursor = 0
+                            $scrollOffset = 0
+                        }
+                    }
+                }
+                continue
+            }
+
+            # 正常浏览模式
+            switch ($key.Key) {
+                ([ConsoleKey]::UpArrow) {
+                    if ($activeItems.Count -gt 0) {
+                        $cursor = ($cursor - 1 + $activeItems.Count) % $activeItems.Count
+                    }
+                }
+                ([ConsoleKey]::DownArrow) {
+                    if ($activeItems.Count -gt 0) {
+                        $cursor = ($cursor + 1) % $activeItems.Count
+                    }
+                }
+                ([ConsoleKey]::Home) {
+                    $cursor = 0
+                }
+                ([ConsoleKey]::End) {
+                    if ($activeItems.Count -gt 0) {
+                        $cursor = $activeItems.Count - 1
+                    }
+                }
+                ([ConsoleKey]::PageUp) {
+                    $cursor = [Math]::Max(0, $cursor - $visibleListCount)
+                }
+                ([ConsoleKey]::PageDown) {
+                    if ($activeItems.Count -gt 0) {
+                        $cursor = [Math]::Min($activeItems.Count - 1, $cursor + $visibleListCount)
+                    }
+                }
+                ([ConsoleKey]::Spacebar) {
+                    if ($null -ne $currItem) {
+                        $currItem.Enabled = -not $currItem.Enabled
+                        $reg.scripts.PSObject.Properties[$currItem.Name].Value.enabled = $currItem.Enabled
+                        Save-ScpmRegistryInternal $reg
+                        Update-ScpmLoaderInternal | Out-Null
+
+                        if ($currItem.Enabled) {
+                            if (Test-Path -LiteralPath $currItem.RealPath) {
+                                try {
+                                    & { . $currItem.RealPath } *>$null
+                                    $statusMsg = "[✓] 已启用 $($currItem.Name) 并即时载入当前终端！"
+                                    $statusMsgColor = "Green"
+                                } catch {
+                                    $statusMsg = "[✓] 已启用 $($currItem.Name) (载入告警: $($_.Exception.Message))"
+                                    $statusMsgColor = "Yellow"
+                                }
+                            }
+                        } else {
+                            $statusMsg = "[✗] 已禁用 $($currItem.Name) (新开终端将不再载入)。"
+                            $statusMsgColor = "Yellow"
+                        }
                     }
                 }
                 default {
                     $ch = [string]$key.KeyChar
-                    if ($ch -in @("q", "Q") -or $key.Key -eq [ConsoleKey]::Escape) {
+                    if ($key.Key -eq [ConsoleKey]::Escape) {
+                        if (-not [string]::IsNullOrWhiteSpace($searchFilter)) {
+                            $searchFilter = ""
+                            $cursor = 0
+                            $statusMsg = "已清除搜索过滤。"
+                            $statusMsgColor = "Gray"
+                        } else {
+                            break
+                        }
+                    } elseif ($ch -in @("q", "Q")) {
                         break
+                    } elseif ($ch -eq "/") {
+                        $inSearchMode = $true
+                        $searchFilter = ""
+                        $cursor = 0
+                        $scrollOffset = 0
                     } elseif ($ch -in @("e", "E")) {
-                        $it = $items[$cursor]
-                        if (Test-Path -LiteralPath $it.RealPath) {
+                        if ($null -ne $currItem -and (Test-Path -LiteralPath $currItem.RealPath)) {
                             if (Get-Command code -ErrorAction SilentlyContinue) {
-                                Start-Process "code" -ArgumentList "`"$($it.RealPath)`""
+                                Start-Process "code" -ArgumentList "`"$($currItem.RealPath)`""
                             } else {
-                                Start-Process "notepad.exe" -ArgumentList "`"$($it.RealPath)`""
+                                Start-Process "notepad.exe" -ArgumentList "`"$($currItem.RealPath)`""
                             }
-                            $statusMsg = "已在编辑器中打开 $($it.Name)。"
+                            $statusMsg = "已在编辑器中打开 $($currItem.Name)。"
                             $statusMsgColor = "Cyan"
                         }
                     } elseif ($ch -in @("n", "N")) {
-                        try { [Console]::CursorVisible = $true } catch {}
-                        Write-Host ""
+                        [Console]::Write("$esc[?25h$esc[2J$esc[1;1H")
+                        Write-Host "`n=== [scpm] 创建新脚本 ===" -ForegroundColor Cyan
                         $newName = Read-Host "请输入新脚本名称 (回车取消)"
                         if (-not [string]::IsNullOrWhiteSpace($newName)) {
                             $newDesc = Read-Host "请输入脚本描述 (可选)"
@@ -917,41 +1627,49 @@ function Invoke-ScpmTui {
                             $items = $data.Items
                             $reg = $data.Registry
                             $cursor = $items.Count - 1
+                            $searchFilter = ""
                             $statusMsg = "[✓] 成功创建新脚本: $newName！"
                             $statusMsgColor = "Green"
-                            Clear-Host
                         }
-                        try { [Console]::CursorVisible = $false } catch {}
+                        [Console]::Write("$esc[?25l$esc[2J$esc[1;1H")
                     } elseif ($ch -in @("s", "S")) {
-                        Invoke-ScpmSync | Out-Null
+                        $syncRes = Invoke-ScpmSync -Silent
                         $data = Refresh-TuiDataInternal
                         $items = $data.Items
                         $reg = $data.Registry
-                        $statusMsg = "[✓] 存储库同步扫描完成，清单已刷新。"
-                        $statusMsgColor = "Green"
-                        Clear-Host
-                    } elseif ($ch -in @("r", "R") -or $key.Key -eq [ConsoleKey]::Delete) {
-                        $it = $items[$cursor]
-                        try { [Console]::CursorVisible = $true } catch {}
-                        Write-Host ""
-                        $confirm = Read-Host "确认从管理清单注销 $($it.Name) 吗？(y/N)"
-                        if ($confirm.Trim().ToLower() -eq "y") {
-                            Invoke-ScpmRemove $it.Name | Out-Null
-                            $data = Refresh-TuiDataInternal
-                            $items = $data.Items
-                            $reg = $data.Registry
-                            if ($cursor -ge $items.Count) { $cursor = [Math]::Max(0, $items.Count - 1) }
-                            $statusMsg = "[✓] 已注销脚本: $($it.Name)。"
+                        if ($syncRes.Added -gt 0) {
+                            $statusMsg = "[✓] 存储库同步完成: 发现并收录 $($syncRes.Added) 个新脚本 ($($syncRes.NewScripts -join ', '))！"
+                            $statusMsgColor = "Green"
+                        } elseif ($syncRes.Missing -gt 0) {
+                            $statusMsg = "[!] 存储库同步告警: 检测到 $($syncRes.Missing) 个脚本文件缺失！"
                             $statusMsgColor = "Yellow"
-                            Clear-Host
+                        } else {
+                            $statusMsg = "[✓] 存储库同步完毕：所有脚本均已是最新的 (共 $($items.Count) 个)。"
+                            $statusMsgColor = "Green"
                         }
-                        try { [Console]::CursorVisible = $false } catch {}
+                    } elseif ($ch -in @("r", "R") -or $key.Key -eq [ConsoleKey]::Delete) {
+                        if ($null -ne $currItem) {
+                            $it = $currItem
+                            [Console]::Write("$esc[?25h$esc[2J$esc[1;1H")
+                            Write-Host "`n=== [scpm] 注销受管理脚本 ===" -ForegroundColor Cyan
+                            $confirm = Read-Host "确认从管理清单注销 $($it.Name) 吗？(y/N)"
+                            if ($confirm.Trim().ToLower() -eq "y") {
+                                Invoke-ScpmRemove $it.Name | Out-Null
+                                $data = Refresh-TuiDataInternal
+                                $items = $data.Items
+                                $reg = $data.Registry
+                                if ($cursor -ge $items.Count) { $cursor = [Math]::Max(0, $items.Count - 1) }
+                                $statusMsg = "[✓] 已注销脚本: $($it.Name)。"
+                                $statusMsgColor = "Yellow"
+                            }
+                            [Console]::Write("$esc[?25l$esc[2J$esc[1;1H")
+                        }
                     } elseif ($ch -in @("a", "A")) {
-                        foreach ($it in $items) {
+                        foreach ($it in $activeItems) {
                             $it.Enabled = $true
                             $reg.scripts.PSObject.Properties[$it.Name].Value.enabled = $true
                             if (Test-Path -LiteralPath $it.RealPath) {
-                                try { . $it.RealPath } catch {}
+                                try { & { . $it.RealPath } *>$null } catch {}
                             }
                         }
                         Save-ScpmRegistryInternal $reg
@@ -959,7 +1677,7 @@ function Invoke-ScpmTui {
                         $statusMsg = "[✓] 已全部启用并即时注入当前会话！"
                         $statusMsgColor = "Green"
                     } elseif ($ch -in @("d", "D")) {
-                        foreach ($it in $items) {
+                        foreach ($it in $activeItems) {
                             $it.Enabled = $false
                             $reg.scripts.PSObject.Properties[$it.Name].Value.enabled = $false
                         }
@@ -968,27 +1686,38 @@ function Invoke-ScpmTui {
                         $statusMsg = "[✗] 已全部禁用。"
                         $statusMsgColor = "Yellow"
                     } elseif ($ch -in @("k", "K")) {
-                        $cursor = ($cursor - 1 + $items.Count) % $items.Count
+                        if ($activeItems.Count -gt 0) {
+                            $cursor = ($cursor - 1 + $activeItems.Count) % $activeItems.Count
+                        }
                     } elseif ($ch -in @("j", "J")) {
-                        $cursor = ($cursor + 1) % $items.Count
+                        if ($activeItems.Count -gt 0) {
+                            $cursor = ($cursor + 1) % $activeItems.Count
+                        }
                     } elseif ($ch -in @("?", "h", "H")) {
-                        $statusMsg = "[↑/↓] 移动 | [空格] 启停 | [e] 编辑 | [n] 新建 | [s] 同步 | [r] 注销 | [q] 退出"
+                        $statusMsg = "[↑/↓]移动 [空格]启停 [/]搜索 [e]编辑 [n]新建 [s]同步 [r]注销 [q]退出"
                         $statusMsgColor = "Cyan"
                     } else {
                         $num = 0
-                        if ([int]::TryParse($ch, [ref]$num) -and $num -ge 1 -and $num -le $items.Count) {
+                        if ([int]::TryParse($ch, [ref]$num) -and $num -ge 1 -and $num -le $activeItems.Count) {
                             $cursor = $num - 1
                         }
                     }
                 }
             }
 
-            if ($key.KeyChar -in @("q", "Q") -or $key.Key -eq [ConsoleKey]::Escape) {
+            if ($key.Key -eq [ConsoleKey]::Escape -and [string]::IsNullOrWhiteSpace($searchFilter)) {
+                break
+            }
+            if ($key.KeyChar -in @("q", "Q")) {
                 break
             }
         }
     } finally {
-        try { [Console]::CursorVisible = $savedCursorVisible } catch {}
+        # 退出备用屏幕缓冲区并恢复光标
+        try {
+            [Console]::Write("$esc[?25h$esc[?1049l")
+            [Console]::CursorVisible = $savedCursorVisible
+        } catch {}
         Write-Host "`n[scpm] 已退出控制台。" -ForegroundColor Gray
     }
 }
@@ -1527,18 +2256,20 @@ function Invoke-ScpmRemove {
 
 function Invoke-ScpmSync {
     [CmdletBinding()]
-    param()
+    param(
+        [switch]$Silent
+    )
 
     $config = Get-ScpmConfigInternal
     if ($null -eq $config) {
-        Write-Host "[错误] scpm 尚未初始化。" -ForegroundColor Red
-        return
+        if (-not $Silent) { Write-Host "[错误] scpm 尚未初始化。" -ForegroundColor Red }
+        return [PSCustomObject]@{ Success = $false; Added = 0; Missing = 0; Enabled = 0; NewScripts = @() }
     }
 
     $storageDir = Resolve-PortablePathInternal $config.storagePath
     if (-not (Test-Path -LiteralPath $storageDir)) {
-        Write-Host "[错误] 存储目录不存在: $storageDir" -ForegroundColor Red
-        return
+        if (-not $Silent) { Write-Host "[错误] 存储目录不存在: $storageDir" -ForegroundColor Red }
+        return [PSCustomObject]@{ Success = $false; Added = 0; Missing = 0; Enabled = 0; NewScripts = @() }
     }
 
     $reg = Get-ScpmRegistryInternal
@@ -1546,10 +2277,13 @@ function Invoke-ScpmSync {
         $reg | Add-Member -NotePropertyName "scripts" -NotePropertyValue ([PSCustomObject]@{}) -Force
     }
 
-    Write-Host "`n=== [scpm] 正在同步存储库 ===`n" -ForegroundColor Cyan
+    if (-not $Silent) {
+        Write-Host "`n=== [scpm] 正在同步存储库 ===`n" -ForegroundColor Cyan
+    }
     $files = Get-ChildItem -LiteralPath $storageDir -Filter "*.ps1" -File
 
     $added = 0
+    $newScriptNames = [System.Collections.Generic.List[string]]::new()
     foreach ($f in $files) {
         if (-not $reg.scripts.PSObject.Properties[$f.Name]) {
             $desc = Extract-ScriptSynopsisInternal $f.FullName
@@ -1563,7 +2297,10 @@ function Invoke-ScpmSync {
                 path = $pPath
                 addedAt = (Get-Date -Format "o")
             }) -Force
-            Write-Host "  [发现新脚本] 已添加并启用: $($f.Name) ($desc)" -ForegroundColor Green
+            if (-not $Silent) {
+                Write-Host "  [发现新脚本] 已添加并启用: $($f.Name) ($desc)" -ForegroundColor Green
+            }
+            $newScriptNames.Add($f.Name)
             $added++
         }
     }
@@ -1573,14 +2310,26 @@ function Invoke-ScpmSync {
     foreach ($prop in $reg.scripts.PSObject.Properties) {
         $p = Resolve-PortablePathInternal $prop.Value.path
         if (-not (Test-Path -LiteralPath $p)) {
-            Write-Host "  [警告] 脚本文件缺失: $($prop.Name) ($p)" -ForegroundColor Yellow
+            if (-not $Silent) {
+                Write-Host "  [警告] 脚本文件缺失: $($prop.Name) ($p)" -ForegroundColor Yellow
+            }
             $missing++
         }
     }
 
     Save-ScpmRegistryInternal $reg
     $enabled = Update-ScpmLoaderInternal
-    Write-Host "`n同步完毕: 新增 $added 个脚本，文件缺失 $missing 个，当前共启用 $enabled 个。" -ForegroundColor Gray
+    if (-not $Silent) {
+        Write-Host "`n同步完毕: 新增 $added 个脚本，文件缺失 $missing 个，当前共启用 $enabled 个。" -ForegroundColor Gray
+    }
+
+    return [PSCustomObject]@{
+        Success = $true
+        Added = $added
+        Missing = $missing
+        Enabled = $enabled
+        NewScripts = $newScriptNames
+    }
 }
 
 function Invoke-ScpmDoctor {
@@ -1927,7 +2676,7 @@ function scpm {
             }
         }
         { $_ -in @("sync", "refresh") } {
-            Invoke-ScpmSync
+            Invoke-ScpmSync | Out-Null
         }
         { $_ -in @("doctor", "status") } {
             Invoke-ScpmDoctor
