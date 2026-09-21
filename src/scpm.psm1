@@ -1,9 +1,9 @@
-﻿# ====================================================================
+# ====================================================================
 # scpm (PowerShell Script Profile Manager)
 # Module: scpm.psm1
 # ====================================================================
 
-$Script:ScpmVersion = "1.0.1"
+$Script:ScpmVersion = "1.1.0"
 $Script:ScpmHome = Join-Path $HOME ".scpm"
 $Script:ConfigFile = Join-Path $Script:ScpmHome "config.json"
 $Script:RegistryFile = Join-Path $Script:ScpmHome "registry.json"
@@ -177,6 +177,229 @@ function Extract-ScriptSynopsisInternal([string]$filePath) {
         }
     } catch {}
     return ""
+}
+
+function Get-ScpmScriptMethodsInternal([string]$filePath) {
+    $result = [PSCustomObject]@{
+        Path = $filePath
+        FileExists = $false
+        Synopsis = ""
+        Description = ""
+        Usage = ""
+        Functions = [System.Collections.Generic.List[object]]::new()
+        Aliases = [System.Collections.Generic.List[object]]::new()
+        TopLevelFunctions = [System.Collections.Generic.List[string]]::new()
+        Summary = ""
+    }
+
+    if (-not (Test-Path -LiteralPath $filePath)) {
+        return $result
+    }
+
+    $result.FileExists = $true
+
+    try {
+        $raw = [System.IO.File]::ReadAllText($filePath, [System.Text.Encoding]::UTF8)
+    } catch {
+        return $result
+    }
+
+    # 1. 提取帮助注释 (.SYNOPSIS, .DESCRIPTION, .USAGE)
+    if ($raw -match '(?s)\.SYNOPSIS\s*(.*?)(?=\r?\n\s*\.[A-Z]+|\#\>)') {
+        $result.Synopsis = $matches[1].Trim()
+    }
+    if ($raw -match '(?s)\.DESCRIPTION\s*(.*?)(?=\r?\n\s*\.[A-Z]+|\#\>)') {
+        $result.Description = $matches[1].Trim()
+    }
+    if ($raw -match '(?s)\.USAGE\s*(.*?)(?=\r?\n\s*\.[A-Z]+|\#\>)') {
+        $result.Usage = $matches[1].Trim()
+    }
+
+    # 2. 通过 AST 解析函数与别名
+    try {
+        $tokens = $null
+        $errors = $null
+        $ast = [System.Management.Automation.Language.Parser]::ParseInput($raw, [ref]$tokens, [ref]$errors)
+
+        if ($null -ne $ast) {
+            $funcAsts = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)
+            foreach ($f in $funcAsts) {
+                # 检查是否为嵌套函数
+                $isNested = $false
+                $enclosing = ""
+                $parent = $f.Parent
+                while ($null -ne $parent) {
+                    if ($parent -is [System.Management.Automation.Language.FunctionDefinitionAst]) {
+                        $isNested = $true
+                        $enclosing = $parent.Name
+                        break
+                    }
+                    $parent = $parent.Parent
+                }
+
+                $params = [System.Collections.Generic.List[object]]::new()
+                $paramBlock = if ($f.Parameters) { $f.Parameters } elseif ($f.Body.ParamBlock) { $f.Body.ParamBlock.Parameters } else { $null }
+                $sigParts = [System.Collections.Generic.List[string]]::new()
+
+                if ($null -ne $paramBlock) {
+                    foreach ($p in $paramBlock) {
+                        $pName = "$" + $p.Name.VariablePath.UserPath
+                        $typeName = if ($p.StaticType -and $p.StaticType.Name -ne "Object") { "[$($p.StaticType.Name)]" } else { "" }
+                        $defaultVal = if ($p.DefaultValue) { $p.DefaultValue.Extent.Text } else { "" }
+
+                        $valSet = $p.Attributes | Where-Object { $_.TypeName.Name -in @("ValidateSet", "ValidateSetAttribute") }
+                        $valSetOptions = @()
+                        if ($valSet) {
+                            $valSetOptions = @($valSet.PositionalArguments | ForEach-Object {
+                                if ($_ -is [System.Management.Automation.Language.StringConstantExpressionAst]) { $_.Value } else { $_.Extent.Text.Trim("'", '"') }
+                            }) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+                        }
+
+                        $params.Add([PSCustomObject]@{
+                            Name = $pName
+                            Type = $typeName
+                            DefaultValue = $defaultVal
+                            ValidateSet = $valSetOptions
+                        })
+
+                        if ($valSetOptions.Count -gt 0) {
+                            $sigParts.Add("[$pName {$($valSetOptions -join ' | ')}]")
+                        } elseif (-not [string]::IsNullOrWhiteSpace($defaultVal)) {
+                            $sigParts.Add("[$pName = $defaultVal]")
+                        } elseif (-not [string]::IsNullOrWhiteSpace($typeName)) {
+                            $sigParts.Add("[$typeName$pName]")
+                        } else {
+                            $sigParts.Add("[$pName]")
+                        }
+                    }
+                }
+
+                $sig = if ($sigParts.Count -gt 0) { "$($f.Name) $($sigParts -join ' ')" } else { $f.Name }
+
+                $funcObj = [PSCustomObject]@{
+                    Name = $f.Name
+                    IsNested = $isNested
+                    Enclosing = $enclosing
+                    Parameters = $params
+                    Signature = $sig
+                    Line = $f.Extent.StartLineNumber
+                }
+                $result.Functions.Add($funcObj)
+
+                if (-not $isNested) {
+                    $result.TopLevelFunctions.Add($f.Name)
+                }
+            }
+
+            # 解析别名 (Set-Alias / New-Alias)
+            $cmdAsts = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true)
+            foreach ($cmd in $cmdAsts) {
+                $cmdName = $cmd.GetCommandName()
+                if ($cmdName -in @("Set-Alias", "New-Alias", "sal")) {
+                    $aliasName = ""
+                    $aliasVal = ""
+                    $elements = $cmd.CommandElements
+                    for ($i = 1; $i -lt $elements.Count; $i++) {
+                        $elemText = $elements[$i].Extent.Text
+                        if ($elemText -in @("-Name", "-n") -and ($i + 1 -lt $elements.Count)) {
+                            $aliasName = $elements[++$i].Extent.Text.Trim("'", '"')
+                        } elseif ($elemText -in @("-Value", "-v") -and ($i + 1 -lt $elements.Count)) {
+                            $aliasVal = $elements[++$i].Extent.Text.Trim("'", '"')
+                        } elseif (-not $aliasName) {
+                            $aliasName = $elemText.Trim("'", '"')
+                        } elseif (-not $aliasVal) {
+                            $aliasVal = $elemText.Trim("'", '"')
+                        }
+                    }
+                    if (-not [string]::IsNullOrWhiteSpace($aliasName)) {
+                        $result.Aliases.Add([PSCustomObject]@{
+                            Name = $aliasName
+                            Target = $aliasVal
+                        })
+                    }
+                }
+            }
+        }
+    } catch {}
+
+    if ($result.TopLevelFunctions.Count -gt 0) {
+        $result.Summary = ($result.TopLevelFunctions -join ", ")
+    } elseif ($result.Functions.Count -gt 0) {
+        $result.Summary = (($result.Functions | ForEach-Object { $_.Name }) -join ", ")
+    } else {
+        $result.Summary = "(直接执行脚本文件)"
+    }
+
+    return $result
+}
+
+function Resolve-ScpmScriptPropsInternal([string]$target, [array]$scriptProps) {
+    $results = [System.Collections.Generic.List[object]]::new()
+    if ([string]::IsNullOrWhiteSpace($target)) { return $results }
+
+    # 1. 尝试数字序号匹配 (1-based)
+    $num = 0
+    if ([int]::TryParse($target, [ref]$num) -and $num -ge 1 -and $num -le $scriptProps.Count) {
+        $results.Add($scriptProps[$num - 1])
+        return $results
+    }
+
+    # 2. 尝试名称精确匹配或加 .ps1 匹配
+    $withExt = if ($target.EndsWith(".ps1", [System.StringComparison]::OrdinalIgnoreCase)) { $target } else { "$target.ps1" }
+    foreach ($p in $scriptProps) {
+        if ($p.Name -eq $target -or $p.Name -eq $withExt) {
+            $results.Add($p)
+            return $results
+        }
+    }
+
+    # 3. 尝试通配符或包含匹配
+    foreach ($p in $scriptProps) {
+        if ($p.Name -like $target -or $p.Name -like "*$target*") {
+            if (-not $results.Contains($p)) {
+                $results.Add($p)
+            }
+        }
+    }
+
+    return $results
+}
+
+function Select-ScpmScriptSingleInteractive([string]$title, [array]$scriptProps) {
+    if ($null -eq $scriptProps -or $scriptProps.Count -eq 0) {
+        return $null
+    }
+
+    Write-Host "`n=== $title ===" -ForegroundColor Cyan
+    for ($i = 0; $i -lt $scriptProps.Count; $i++) {
+        $p = $scriptProps[$i]
+        $st = if ($p.Value.enabled) { "[✓]" } else { "[✗]" }
+        $stColor = if ($p.Value.enabled) { "Green" } else { "DarkGray" }
+        Write-Host "  [$($i + 1)] " -NoNewline -ForegroundColor White
+        Write-Host "$st " -NoNewline -ForegroundColor $stColor
+        Write-Host "$($p.Name.PadRight(22))" -NoNewline -ForegroundColor Cyan
+        Write-Host "$($p.Value.description)" -ForegroundColor Gray
+    }
+
+    $choice = Read-Host "`n请选择脚本编号 [1-$($scriptProps.Count)] (q 退出)"
+    if ([string]::IsNullOrWhiteSpace($choice) -or $choice.Trim().ToLower() -in @("q", "quit", "exit")) {
+        Write-Host "已取消。" -ForegroundColor Gray
+        return $null
+    }
+
+    $num = 0
+    if ([int]::TryParse($choice.Trim(), [ref]$num) -and $num -ge 1 -and $num -le $scriptProps.Count) {
+        return $scriptProps[$num - 1]
+    }
+
+    # 尝试按名称查
+    $matched = Resolve-ScpmScriptPropsInternal $choice.Trim() $scriptProps
+    if ($matched.Count -gt 0) {
+        return $matched[0]
+    }
+
+    Write-Host "[错误] 无效的编号或名称。" -ForegroundColor Red
+    return $null
 }
 
 # --------------------------------------------------------------------
@@ -369,7 +592,7 @@ if (Test-Path -LiteralPath $scpmLoader) { . $scpmLoader }
 
 function Invoke-ScpmList {
     [CmdletBinding()]
-    param()
+    param([switch]$Detail)
 
     $reg = Get-ScpmRegistryInternal
     $config = Get-ScpmConfigInternal
@@ -387,12 +610,14 @@ function Invoke-ScpmList {
     $total = 0
     $enabled = 0
     $disabled = 0
+    $idx = 1
 
     foreach ($prop in $reg.scripts.PSObject.Properties) {
         $item = $prop.Value
         $total++
         $realPath = Resolve-PortablePathInternal $item.path
         $fileExists = Test-Path -LiteralPath $realPath
+        $mInfo = Get-ScpmScriptMethodsInternal $realPath
 
         $statusMark = if ($item.enabled) {
             $enabled++
@@ -402,41 +627,403 @@ function Invoke-ScpmList {
             " [✗] "
         }
         $statusColor = if ($item.enabled) { "Green" } else { "DarkGray" }
+        $idxStr = "[$idx]".PadRight(5)
 
+        Write-Host " $idxStr" -ForegroundColor DarkGray -NoNewline
         Write-Host $statusMark -ForegroundColor $statusColor -NoNewline
         Write-Host "$($item.name.PadRight(22))" -ForegroundColor Cyan -NoNewline
         Write-Host "$($item.description)" -ForegroundColor White
 
-        $indent = "       "
+        $indent = "            "
         if (-not $fileExists) {
             Write-Host "$indent[文件缺失] $realPath" -ForegroundColor Red
         } else {
-            Write-Host "$indent$($item.path)" -ForegroundColor DarkGray
+            Write-Host "${indent}路径: $($item.path)" -ForegroundColor DarkGray
+            if (-not [string]::IsNullOrWhiteSpace($mInfo.Summary)) {
+                Write-Host "${indent}方法: " -NoNewline -ForegroundColor DarkGray
+                Write-Host "$($mInfo.Summary)" -ForegroundColor Yellow
+            }
         }
+
+        if ($Detail -and $fileExists) {
+            if ($mInfo.Functions.Count -gt 0) {
+                foreach ($fn in $mInfo.Functions) {
+                    if (-not $fn.IsNested) {
+                        Write-Host "$indent  └─ $($fn.Signature)" -ForegroundColor White
+                    }
+                }
+            }
+        }
+
+        $idx++
     }
 
     Write-Host "`n-----------------------------------------------------" -ForegroundColor DarkGray
     Write-Host "总计: $total 个脚本 | 已启用: $enabled | 已禁用: $disabled" -ForegroundColor Gray
-    Write-Host "提示: 使用 'scpm enable <名称>' 或 'scpm disable <名称>' 切换注入。" -ForegroundColor DarkGray
+    Write-Host "提示: 运行 'sm toggle' 集中启停管理，'sm info <编号>' 查看方法详情。" -ForegroundColor DarkGray
 }
 
-function Invoke-ScpmEnable {
-    $reg = Get-ScpmRegistryInternal
-    $updated = $false
+function Invoke-ScpmTui {
+    [CmdletBinding()]
+    param()
 
-    foreach ($rawName in $args) {
-        $targetName = if ($rawName.EndsWith(".ps1", [System.StringComparison]::OrdinalIgnoreCase)) { $rawName } else { "$rawName.ps1" }
-        
-        $matched = $false
-        foreach ($prop in $reg.scripts.PSObject.Properties) {
-            if ($prop.Name -like $targetName -or $prop.Name -like $rawName) {
-                $matched = $true
+    # 1. 检测终端是否支持交互式 TUI
+    $isInteractive = $false
+    try {
+        if (-not [Console]::IsInputRedirected -and -not [Console]::IsOutputRedirected -and [Environment]::UserInteractive) {
+            $null = $Host.UI.RawUI.CursorPosition
+            $isInteractive = $true
+        }
+    } catch {
+        $isInteractive = $false
+    }
+
+    if (-not $isInteractive) {
+        Write-Host "[scpm] 检测到当前终端处于非交互或重定向环境，为您展示清单：" -ForegroundColor Yellow
+        Invoke-ScpmList
+        return
+    }
+
+    function Refresh-TuiDataInternal {
+        $reg = Get-ScpmRegistryInternal
+        $scriptProps = @()
+        if ($null -ne $reg.scripts) {
+            $scriptProps = @($reg.scripts.PSObject.Properties)
+        }
+
+        $items = [System.Collections.Generic.List[object]]::new()
+        for ($i = 0; $i -lt $scriptProps.Count; $i++) {
+            $p = $scriptProps[$i]
+            $realPath = Resolve-PortablePathInternal $p.Value.path
+            $mInfo = Get-ScpmScriptMethodsInternal $realPath
+            $items.Add([PSCustomObject]@{
+                Index = ($i + 1)
+                Name = $p.Name
+                Enabled = [bool]$p.Value.enabled
+                Description = $p.Value.description
+                Path = $p.Value.path
+                RealPath = $realPath
+                FileExists = (Test-Path -LiteralPath $realPath)
+                MethodInfo = $mInfo
+            })
+        }
+        return @{
+            Registry = $reg
+            Items = $items
+        }
+    }
+
+    $data = Refresh-TuiDataInternal
+    $items = $data.Items
+    $reg = $data.Registry
+    $config = Get-ScpmConfigInternal
+
+    if ($items.Count -eq 0) {
+        Write-Host "`n[scpm] 当前暂无受管理的脚本。使用 'sm add <路径>' 或 'sm new <名称>' 开始添加！" -ForegroundColor Yellow
+        return
+    }
+
+    $cursor = 0
+    $statusMsg = "欢迎进入 scpm 控制台！[↑/↓] 导航，[空格] 原地启停，[q] 退出。"
+    $statusMsgColor = "Gray"
+
+    $savedCursorVisible = $true
+    try {
+        $savedCursorVisible = [Console]::CursorVisible
+        [Console]::CursorVisible = $false
+    } catch {}
+
+    Clear-Host
+    $startPos = [System.Management.Automation.Host.Coordinates]::new(0, 0)
+
+    try {
+        while ($true) {
+            if ($cursor -ge $items.Count) { $cursor = [Math]::Max(0, $items.Count - 1) }
+
+            $currItem = $items[$cursor]
+            $currMethodInfo = $currItem.MethodInfo
+
+            $winWidth = 84
+            try {
+                $winWidth = [Math]::Max(70, [Math]::Min(110, $Host.UI.RawUI.WindowSize.Width - 1))
+            } catch {}
+
+            $borderLine = "─" * $winWidth
+
+            # 重置光标到左上角重绘
+            try { $Host.UI.RawUI.CursorPosition = $startPos } catch {}
+
+            # --- 区域 1: 标题与统计 ---
+            $enabledCount = @($items | Where-Object { $_.Enabled }).Count
+            $disabledCount = $items.Count - $enabledCount
+            $storePathStr = if ($config) { $config.storagePath } else { "$HOME\.scpm\scripts" }
+
+            Write-Host "=== [scpm] 脚本集中管理控制台 v$Script:ScpmVersion ===".PadRight($winWidth) -ForegroundColor Cyan
+            Write-Host "存储库: $storePathStr | 总计: $($items.Count) 个脚本 (已启用: $enabledCount, 已禁用: $disabledCount)".PadRight($winWidth) -ForegroundColor DarkGray
+            Write-Host ""
+
+            # --- 区域 2: 脚本列表区 ---
+            Write-Host "[受管理脚本列表] (按空格键即时翻转启停状态)".PadRight($winWidth) -ForegroundColor Yellow
+
+            for ($i = 0; $i -lt $items.Count; $i++) {
+                $it = $items[$i]
+                $isCurrent = ($i -eq $cursor)
+
+                $ptr = if ($isCurrent) { " > " } else { "   " }
+                $pColor = if ($isCurrent) { "Yellow" } else { "DarkGray" }
+                
+                $st = if ($it.Enabled) { "[✓ 已启用]" } else { "[✗ 已禁用]" }
+                $stColor = if ($it.Enabled) { "Green" } else { "DarkGray" }
+
+                $idxStr = "[$($it.Index)]".PadRight(5)
+                $nameStr = $it.Name.PadRight(22)
+                $descStr = $it.Description
+
+                Write-Host $ptr -ForegroundColor $pColor -NoNewline
+                Write-Host $idxStr -ForegroundColor DarkGray -NoNewline
+                Write-Host " $st " -ForegroundColor $stColor -NoNewline
+                Write-Host $nameStr -ForegroundColor (if ($isCurrent) { "Cyan" } else { "White" }) -NoNewline
+
+                $usedLen = 3 + 5 + 10 + 22 + 2
+                $remLen = [Math]::Max(10, $winWidth - $usedLen)
+                $descPadded = if ($descStr.Length -gt $remLen) { $descStr.Substring(0, $remLen - 3) + "..." } else { $descStr.PadRight($remLen) }
+                Write-Host " $descPadded" -ForegroundColor Gray
+            }
+
+            Write-Host ""
+            Write-Host ("─" * [Math]::Min($winWidth, 80)) -ForegroundColor DarkCyan
+
+            # --- 区域 3: 实时导出方法与用法联动预览区 ---
+            Write-Host "[实时导出方法与用法预览: $($currItem.Name)]".PadRight($winWidth) -ForegroundColor Yellow
+            Write-Host "  文件路径: $($currItem.Path)".PadRight($winWidth) -ForegroundColor DarkGray
+            
+            Write-Host "  导出方法 / 全局函数:".PadRight($winWidth) -ForegroundColor Green
+            if ($currMethodInfo.Functions.Count -eq 0) {
+                Write-Host "    • (该脚本未定义函数，作为独立脚本直接执行)".PadRight($winWidth) -ForegroundColor DarkGray
+            } else {
+                $shownFuncCount = 0
+                foreach ($fn in $currMethodInfo.Functions) {
+                    if (-not $fn.IsNested -and $shownFuncCount -lt 4) {
+                        Write-Host "    • " -NoNewline -ForegroundColor Cyan
+                        Write-Host "$($fn.Signature)" -ForegroundColor White
+                        if ($fn.Parameters.Count -gt 0) {
+                            foreach ($param in $fn.Parameters) {
+                                if ($param.ValidateSet.Count -gt 0) {
+                                    Write-Host "        $($param.Name) 可选值: $($param.ValidateSet -join ', ')".PadRight($winWidth) -ForegroundColor Yellow
+                                }
+                            }
+                        }
+                        $shownFuncCount++
+                    }
+                }
+                $nested = @($currMethodInfo.Functions | Where-Object { $_.IsNested })
+                if ($nested.Count -gt 0) {
+                    $nestedNames = ($nested | ForEach-Object { $_.Name }) -join ", "
+                    Write-Host "    (内部辅助函数: $nestedNames)".PadRight($winWidth) -ForegroundColor DarkGray
+                }
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($currMethodInfo.Usage)) {
+                Write-Host "  用法示例 (USAGE):".PadRight($winWidth) -ForegroundColor Green
+                $uLines = $currMethodInfo.Usage -split '\r?\n'
+                $shownUsage = 0
+                foreach ($ul in $uLines) {
+                    if (-not [string]::IsNullOrWhiteSpace($ul) -and $shownUsage -lt 4) {
+                        $ulText = "    " + $ul.Trim()
+                        Write-Host $ulText.PadRight($winWidth) -ForegroundColor Gray
+                        $shownUsage++
+                    }
+                }
+            } elseif (-not [string]::IsNullOrWhiteSpace($currMethodInfo.Description)) {
+                Write-Host "  详细说明:".PadRight($winWidth) -ForegroundColor Green
+                $dLines = $currMethodInfo.Description -split '\r?\n'
+                $shownDesc = 0
+                foreach ($dl in $dLines) {
+                    if (-not [string]::IsNullOrWhiteSpace($dl) -and $shownDesc -lt 3) {
+                        Write-Host ("    " + $dl.Trim()).PadRight($winWidth) -ForegroundColor Gray
+                        $shownDesc++
+                    }
+                }
+            }
+
+            Write-Host ("─" * [Math]::Min($winWidth, 80)) -ForegroundColor DarkCyan
+
+            # --- 区域 4: 底部快捷键提示与状态条 ---
+            Write-Host "快捷键: [↑/↓] 移动 | [空格] 启停切换 | [e] 编辑 | [n] 新建 | [s] 同步 | [r] 移除 | [q] 退出".PadRight($winWidth) -ForegroundColor DarkGray
+            Write-Host "状态提示: $statusMsg".PadRight($winWidth) -ForegroundColor $statusMsgColor
+
+            # 清除可能残留的多余行
+            for ($k = 0; $k -lt 3; $k++) {
+                Write-Host (" " * $winWidth)
+            }
+            try { $Host.UI.RawUI.CursorPosition = [System.Management.Automation.Host.Coordinates]::new(0, $Host.UI.RawUI.CursorPosition.Y - 3) } catch {}
+
+            # --- 键盘事件监听 ---
+            $key = [Console]::ReadKey($true)
+            switch ($key.Key) {
+                ([ConsoleKey]::UpArrow) {
+                    $cursor = ($cursor - 1 + $items.Count) % $items.Count
+                }
+                ([ConsoleKey]::DownArrow) {
+                    $cursor = ($cursor + 1) % $items.Count
+                }
+                ([ConsoleKey]::Spacebar) {
+                    $it = $items[$cursor]
+                    $it.Enabled = -not $it.Enabled
+                    $reg.scripts.PSObject.Properties[$it.Name].Value.enabled = $it.Enabled
+                    Save-ScpmRegistryInternal $reg
+                    Update-ScpmLoaderInternal | Out-Null
+
+                    if ($it.Enabled) {
+                        if (Test-Path -LiteralPath $it.RealPath) {
+                            try {
+                                . $it.RealPath
+                                $statusMsg = "[✓] 已启用 $($it.Name) 并即时载入当前终端！"
+                                $statusMsgColor = "Green"
+                            } catch {
+                                $statusMsg = "[✓] 已启用 $($it.Name) (载入告警: $($_.Exception.Message))"
+                                $statusMsgColor = "Yellow"
+                            }
+                        }
+                    } else {
+                        $statusMsg = "[✗] 已禁用 $($it.Name) (新开终端将不再载入)。"
+                        $statusMsgColor = "Yellow"
+                    }
+                }
+                default {
+                    $ch = [string]$key.KeyChar
+                    if ($ch -in @("q", "Q") -or $key.Key -eq [ConsoleKey]::Escape) {
+                        break
+                    } elseif ($ch -in @("e", "E")) {
+                        $it = $items[$cursor]
+                        if (Test-Path -LiteralPath $it.RealPath) {
+                            if (Get-Command code -ErrorAction SilentlyContinue) {
+                                Start-Process "code" -ArgumentList "`"$($it.RealPath)`""
+                            } else {
+                                Start-Process "notepad.exe" -ArgumentList "`"$($it.RealPath)`""
+                            }
+                            $statusMsg = "已在编辑器中打开 $($it.Name)。"
+                            $statusMsgColor = "Cyan"
+                        }
+                    } elseif ($ch -in @("n", "N")) {
+                        try { [Console]::CursorVisible = $true } catch {}
+                        Write-Host ""
+                        $newName = Read-Host "请输入新脚本名称 (回车取消)"
+                        if (-not [string]::IsNullOrWhiteSpace($newName)) {
+                            $newDesc = Read-Host "请输入脚本描述 (可选)"
+                            Invoke-ScpmNew $newName -Desc $newDesc -NoEdit
+                            $data = Refresh-TuiDataInternal
+                            $items = $data.Items
+                            $reg = $data.Registry
+                            $cursor = $items.Count - 1
+                            $statusMsg = "[✓] 成功创建新脚本: $newName！"
+                            $statusMsgColor = "Green"
+                            Clear-Host
+                        }
+                        try { [Console]::CursorVisible = $false } catch {}
+                    } elseif ($ch -in @("s", "S")) {
+                        Invoke-ScpmSync | Out-Null
+                        $data = Refresh-TuiDataInternal
+                        $items = $data.Items
+                        $reg = $data.Registry
+                        $statusMsg = "[✓] 存储库同步扫描完成，清单已刷新。"
+                        $statusMsgColor = "Green"
+                        Clear-Host
+                    } elseif ($ch -in @("r", "R") -or $key.Key -eq [ConsoleKey]::Delete) {
+                        $it = $items[$cursor]
+                        try { [Console]::CursorVisible = $true } catch {}
+                        Write-Host ""
+                        $confirm = Read-Host "确认从管理清单注销 $($it.Name) 吗？(y/N)"
+                        if ($confirm.Trim().ToLower() -eq "y") {
+                            Invoke-ScpmRemove $it.Name | Out-Null
+                            $data = Refresh-TuiDataInternal
+                            $items = $data.Items
+                            $reg = $data.Registry
+                            if ($cursor -ge $items.Count) { $cursor = [Math]::Max(0, $items.Count - 1) }
+                            $statusMsg = "[✓] 已注销脚本: $($it.Name)。"
+                            $statusMsgColor = "Yellow"
+                            Clear-Host
+                        }
+                        try { [Console]::CursorVisible = $false } catch {}
+                    } elseif ($ch -in @("a", "A")) {
+                        foreach ($it in $items) {
+                            $it.Enabled = $true
+                            $reg.scripts.PSObject.Properties[$it.Name].Value.enabled = $true
+                            if (Test-Path -LiteralPath $it.RealPath) {
+                                try { . $it.RealPath } catch {}
+                            }
+                        }
+                        Save-ScpmRegistryInternal $reg
+                        Update-ScpmLoaderInternal | Out-Null
+                        $statusMsg = "[✓] 已全部启用并即时注入当前会话！"
+                        $statusMsgColor = "Green"
+                    } elseif ($ch -in @("d", "D")) {
+                        foreach ($it in $items) {
+                            $it.Enabled = $false
+                            $reg.scripts.PSObject.Properties[$it.Name].Value.enabled = $false
+                        }
+                        Save-ScpmRegistryInternal $reg
+                        Update-ScpmLoaderInternal | Out-Null
+                        $statusMsg = "[✗] 已全部禁用。"
+                        $statusMsgColor = "Yellow"
+                    } elseif ($ch -in @("k", "K")) {
+                        $cursor = ($cursor - 1 + $items.Count) % $items.Count
+                    } elseif ($ch -in @("j", "J")) {
+                        $cursor = ($cursor + 1) % $items.Count
+                    } elseif ($ch -in @("?", "h", "H")) {
+                        $statusMsg = "[↑/↓] 移动 | [空格] 启停 | [e] 编辑 | [n] 新建 | [s] 同步 | [r] 注销 | [q] 退出"
+                        $statusMsgColor = "Cyan"
+                    } else {
+                        $num = 0
+                        if ([int]::TryParse($ch, [ref]$num) -and $num -ge 1 -and $num -le $items.Count) {
+                            $cursor = $num - 1
+                        }
+                    }
+                }
+            }
+
+            if ($key.KeyChar -in @("q", "Q") -or $key.Key -eq [ConsoleKey]::Escape) {
+                break
+            }
+        }
+    } finally {
+        try { [Console]::CursorVisible = $savedCursorVisible } catch {}
+        Write-Host "`n[scpm] 已退出控制台。" -ForegroundColor Gray
+    }
+}
+
+function Invoke-ScpmToggle {
+    [CmdletBinding()]
+    param(
+        [Parameter(Position = 0, ValueFromRemainingArguments = $true)]
+        [string[]]$Targets
+    )
+
+    $cleanTargets = @()
+    if ($null -ne $Targets) {
+        $cleanTargets = @($Targets | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    }
+
+    if ($cleanTargets.Count -gt 0) {
+        $reg = Get-ScpmRegistryInternal
+        if ($null -eq $reg.scripts -or $reg.scripts.PSObject.Properties.Count -eq 0) {
+            Write-Host "当前暂无受管理的脚本。使用 'scpm add <路径>' 添加脚本。" -ForegroundColor Yellow
+            return
+        }
+        $scriptProps = @($reg.scripts.PSObject.Properties)
+        $updated = $false
+        foreach ($t in $cleanTargets) {
+            $matchedProps = Resolve-ScpmScriptPropsInternal $t $scriptProps
+            if ($matchedProps.Count -eq 0) {
+                Write-Host "[错误] 未找到匹配 '$t' 的脚本。" -ForegroundColor Red
+                continue
+            }
+            foreach ($prop in $matchedProps) {
                 $item = $prop.Value
-                if (-not $item.enabled) {
-                    $item.enabled = $true
-                    $updated = $true
+                $item.enabled = -not $item.enabled
+                $updated = $true
+                if ($item.enabled) {
                     Write-Host "[✓] 已启用: $($prop.Name)" -ForegroundColor Green
-                    
                     $realPath = Resolve-PortablePathInternal $item.path
                     if (Test-Path -LiteralPath $realPath) {
                         try {
@@ -447,13 +1034,62 @@ function Invoke-ScpmEnable {
                         }
                     }
                 } else {
-                    Write-Host "[提示] $($prop.Name) 已经是启用状态。" -ForegroundColor Yellow
+                    Write-Host "[✗] 已禁用: $($prop.Name) (将在新终端会话生效)" -ForegroundColor Yellow
                 }
             }
         }
+        if ($updated) {
+            Save-ScpmRegistryInternal $reg
+            Update-ScpmLoaderInternal | Out-Null
+        }
+    } else {
+        Invoke-ScpmTui
+    }
+}
 
-        if (-not $matched) {
-            Write-Host "[错误] 未找到名为 '$rawName' 的脚本。" -ForegroundColor Red
+function Invoke-ScpmEnable {
+    $reg = Get-ScpmRegistryInternal
+    if ($null -eq $reg.scripts -or $reg.scripts.PSObject.Properties.Count -eq 0) {
+        Write-Host "当前暂无受管理的脚本。使用 'scpm add <路径>' 添加脚本。" -ForegroundColor Yellow
+        return
+    }
+
+    if ($args.Count -eq 0) {
+        Invoke-ScpmToggle
+        return
+    }
+
+    $scriptProps = @($reg.scripts.PSObject.Properties)
+    $updated = $false
+
+    foreach ($rawName in $args) {
+        $matchedProps = Resolve-ScpmScriptPropsInternal $rawName $scriptProps
+        if ($matchedProps.Count -eq 0) {
+            Write-Host "[错误] 未找到名为或序号为 '$rawName' 的脚本。" -ForegroundColor Red
+            continue
+        }
+
+        foreach ($prop in $matchedProps) {
+            $item = $prop.Value
+            if (-not $item.enabled) {
+                $item.enabled = $true
+                $updated = $true
+                Write-Host "[✓] 已启用: $($prop.Name)" -ForegroundColor Green
+                
+                $realPath = Resolve-PortablePathInternal $item.path
+                if (Test-Path -LiteralPath $realPath) {
+                    try {
+                        . $realPath
+                        $mInfo = Get-ScpmScriptMethodsInternal $realPath
+                        $m = if ($mInfo.Summary) { " (导出方法: $($mInfo.Summary))" } else { "" }
+                        Write-Host "    已即时载入当前终端会话$m。" -ForegroundColor Gray
+                    } catch {
+                        Write-Warning "    即时载入失败: $($_.Exception.Message)"
+                    }
+                }
+            } else {
+                Write-Host "[提示] $($prop.Name) 已经是启用状态。" -ForegroundColor Yellow
+            }
         }
     }
 
@@ -465,34 +1101,186 @@ function Invoke-ScpmEnable {
 
 function Invoke-ScpmDisable {
     $reg = Get-ScpmRegistryInternal
+    if ($null -eq $reg.scripts -or $reg.scripts.PSObject.Properties.Count -eq 0) {
+        Write-Host "当前暂无受管理的脚本。" -ForegroundColor Yellow
+        return
+    }
+
+    if ($args.Count -eq 0) {
+        Invoke-ScpmToggle
+        return
+    }
+
+    $scriptProps = @($reg.scripts.PSObject.Properties)
     $updated = $false
 
     foreach ($rawName in $args) {
-        $targetName = if ($rawName.EndsWith(".ps1", [System.StringComparison]::OrdinalIgnoreCase)) { $rawName } else { "$rawName.ps1" }
-        
-        $matched = $false
-        foreach ($prop in $reg.scripts.PSObject.Properties) {
-            if ($prop.Name -like $targetName -or $prop.Name -like $rawName) {
-                $matched = $true
-                $item = $prop.Value
-                if ($item.enabled) {
-                    $item.enabled = $false
-                    $updated = $true
-                    Write-Host "[✗] 已禁用: $($prop.Name) (将在下次新开会话生效)" -ForegroundColor Yellow
-                } else {
-                    Write-Host "[提示] $($prop.Name) 已经是禁用状态。" -ForegroundColor Gray
-                }
-            }
+        $matchedProps = Resolve-ScpmScriptPropsInternal $rawName $scriptProps
+        if ($matchedProps.Count -eq 0) {
+            Write-Host "[错误] 未找到名为或序号为 '$rawName' 的脚本。" -ForegroundColor Red
+            continue
         }
 
-        if (-not $matched) {
-            Write-Host "[错误] 未找到名为 '$rawName' 的脚本。" -ForegroundColor Red
+        foreach ($prop in $matchedProps) {
+            $item = $prop.Value
+            if ($item.enabled) {
+                $item.enabled = $false
+                $updated = $true
+                Write-Host "[✗] 已禁用: $($prop.Name) (将在下次新开会话生效)" -ForegroundColor Yellow
+            } else {
+                Write-Host "[提示] $($prop.Name) 已经是禁用状态。" -ForegroundColor Gray
+            }
         }
     }
 
     if ($updated) {
         Save-ScpmRegistryInternal $reg
         Update-ScpmLoaderInternal | Out-Null
+    }
+}
+
+function Show-SingleScriptInfoInternal([int]$index, [string]$name, [object]$item) {
+    $realPath = Resolve-PortablePathInternal $item.path
+    $mInfo = Get-ScpmScriptMethodsInternal $realPath
+
+    Write-Host ""
+    Write-Host "================================================================================" -ForegroundColor Cyan
+    Write-Host " [$index] 脚本: " -NoNewline -ForegroundColor Cyan
+    Write-Host "$name" -ForegroundColor Yellow -NoNewline
+    if ($item.enabled) {
+        Write-Host "  [✓ 已启用 - 自动注入当前终端]" -ForegroundColor Green
+    } else {
+        Write-Host "  [✗ 已禁用]" -ForegroundColor DarkGray
+    }
+    Write-Host "================================================================================" -ForegroundColor Cyan
+
+    Write-Host "  文件路径: " -NoNewline -ForegroundColor DarkGray
+    if ($mInfo.FileExists) {
+        Write-Host "$($item.path)" -ForegroundColor White
+    } else {
+        Write-Host "$($item.path) [文件缺失!]" -ForegroundColor Red
+        return
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($item.description)) {
+        Write-Host "  脚本简介: " -NoNewline -ForegroundColor DarkGray
+        Write-Host "$($item.description)" -ForegroundColor Gray
+    }
+
+    Write-Host "`n  [提供的方法 / 导出函数]" -ForegroundColor Green
+    if ($mInfo.Functions.Count -eq 0) {
+        Write-Host "    • (该脚本未定义函数，作为脚本文件直接执行)" -ForegroundColor DarkGray
+    } else {
+        foreach ($fn in $mInfo.Functions) {
+            if (-not $fn.IsNested) {
+                Write-Host "    • " -NoNewline -ForegroundColor Cyan
+                Write-Host "$($fn.Signature)" -ForegroundColor White
+                if ($fn.Parameters.Count -gt 0) {
+                    foreach ($param in $fn.Parameters) {
+                        if ($param.ValidateSet.Count -gt 0) {
+                            Write-Host "        $($param.Name) 可选值: " -NoNewline -ForegroundColor DarkGray
+                            Write-Host "$($param.ValidateSet -join ', ')" -ForegroundColor Yellow
+                        }
+                    }
+                }
+            }
+        }
+        $nestedFuncs = @($mInfo.Functions | Where-Object { $_.IsNested })
+        if ($nestedFuncs.Count -gt 0) {
+            $nestedNames = ($nestedFuncs | ForEach-Object { $_.Name }) -join ", "
+            Write-Host "    (内部辅助函数: $nestedNames)" -ForegroundColor DarkGray
+        }
+    }
+
+    if ($mInfo.Aliases.Count -gt 0) {
+        Write-Host "`n  [导出的别名 (Aliases)]" -ForegroundColor Green
+        foreach ($al in $mInfo.Aliases) {
+            Write-Host "    • $($al.Name) -> $($al.Target)" -ForegroundColor Cyan
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($mInfo.Usage)) {
+        Write-Host "`n  [用法示例 (USAGE)]" -ForegroundColor Green
+        $uLines = $mInfo.Usage -split '\r?\n'
+        foreach ($ul in $uLines) {
+            Write-Host "    $ul" -ForegroundColor Gray
+        }
+    } elseif (-not [string]::IsNullOrWhiteSpace($mInfo.Description)) {
+        Write-Host "`n  [详细说明 (DESCRIPTION)]" -ForegroundColor Green
+        $dLines = $mInfo.Description -split '\r?\n'
+        foreach ($dl in $dLines) {
+            Write-Host "    $dl" -ForegroundColor Gray
+        }
+    }
+
+    Write-Host ""
+}
+
+function Invoke-ScpmInfo {
+    [CmdletBinding()]
+    param(
+        [Parameter(Position = 0, ValueFromRemainingArguments = $true)]
+        [string[]]$Targets,
+
+        [switch]$All
+    )
+
+    $reg = Get-ScpmRegistryInternal
+    if ($null -eq $reg.scripts -or $reg.scripts.PSObject.Properties.Count -eq 0) {
+        Write-Host "当前暂无受管理的脚本。使用 'scpm add <路径>' 添加脚本。" -ForegroundColor Yellow
+        return
+    }
+
+    $scriptProps = @($reg.scripts.PSObject.Properties)
+
+    # 1. 检查是否查看全部
+    $showAll = $All.IsPresent -or ($Targets -contains "-All") -or ($Targets -contains "--all") -or ($Targets -contains "-a") -or ($Targets -contains "all")
+
+    if ($showAll) {
+        Write-Host "`n=== [scpm] 全部受管理脚本方法与函数总览 ===" -ForegroundColor Cyan
+        for ($i = 0; $i -lt $scriptProps.Count; $i++) {
+            $p = $scriptProps[$i]
+            Show-SingleScriptInfoInternal ($i + 1) $p.Name $p.Value
+        }
+        return
+    }
+
+    # 2. 如果没有传参，进行交互式选择
+    if ($null -eq $Targets -or $Targets.Count -eq 0) {
+        Write-Host "`n=== [scpm] 脚本方法与命令详情查询 ===" -ForegroundColor Cyan
+        for ($i = 0; $i -lt $scriptProps.Count; $i++) {
+            $p = $scriptProps[$i]
+            $st = if ($p.Value.enabled) { "[✓]" } else { "[✗]" }
+            $stColor = if ($p.Value.enabled) { "Green" } else { "DarkGray" }
+            Write-Host "  [$($i + 1)] " -NoNewline -ForegroundColor White
+            Write-Host "$st " -NoNewline -ForegroundColor $stColor
+            Write-Host "$($p.Name.PadRight(22))" -NoNewline -ForegroundColor Cyan
+            Write-Host "$($p.Value.description)" -ForegroundColor Gray
+        }
+        Write-Host "  [a] 查看所有脚本提供的方法清单" -ForegroundColor Yellow
+
+        $choice = Read-Host "`n请选择要查看的脚本编号 [1-$($scriptProps.Count)] (输入 a 查看全部, q 退出)"
+        if ([string]::IsNullOrWhiteSpace($choice) -or $choice.Trim().ToLower() -in @("q", "quit", "exit")) {
+            return
+        }
+        if ($choice.Trim().ToLower() -in @("a", "all")) {
+            Invoke-ScpmInfo -All
+            return
+        }
+        $Targets = @($choice.Trim())
+    }
+
+    # 3. 显示指定的脚本详情
+    foreach ($t in $Targets) {
+        $matchedProps = Resolve-ScpmScriptPropsInternal $t $scriptProps
+        if ($matchedProps.Count -eq 0) {
+            Write-Host "[错误] 未找到匹配 '$t' 的脚本。" -ForegroundColor Red
+            continue
+        }
+        foreach ($prop in $matchedProps) {
+            $idx = ($scriptProps.IndexOf($prop) + 1)
+            Show-SingleScriptInfoInternal $idx $prop.Name $prop.Value
+        }
     }
 }
 
@@ -654,23 +1442,28 @@ function $fnName {
 }
 
 function Invoke-ScpmEdit {
-    $targetName = if ($args[0].EndsWith(".ps1", [System.StringComparison]::OrdinalIgnoreCase)) { $args[0] } else { "$($args[0]).ps1" }
     $reg = Get-ScpmRegistryInternal
-
-    $foundItem = $null
-    foreach ($prop in $reg.scripts.PSObject.Properties) {
-        if ($prop.Name -like $targetName -or $prop.Name -like $args[0]) {
-            $foundItem = $prop.Value
-            break
-        }
-    }
-
-    if ($null -eq $foundItem) {
-        Write-Host "[错误] 未找到脚本: $($args[0])" -ForegroundColor Red
+    if ($null -eq $reg.scripts -or $reg.scripts.PSObject.Properties.Count -eq 0) {
+        Write-Host "当前暂无受管理的脚本。" -ForegroundColor Yellow
         return
     }
 
-    $realPath = Resolve-PortablePathInternal $foundItem.path
+    $scriptProps = @($reg.scripts.PSObject.Properties)
+    $targetProp = $null
+
+    if ($args.Count -eq 0) {
+        $targetProp = Select-ScpmScriptSingleInteractive "请选择要编辑的脚本" $scriptProps
+        if ($null -eq $targetProp) { return }
+    } else {
+        $matchedProps = Resolve-ScpmScriptPropsInternal $args[0] $scriptProps
+        if ($matchedProps.Count -eq 0) {
+            Write-Host "[错误] 未找到脚本: $($args[0])" -ForegroundColor Red
+            return
+        }
+        $targetProp = $matchedProps[0]
+    }
+
+    $realPath = Resolve-PortablePathInternal $targetProp.Value.path
     if (-not (Test-Path -LiteralPath $realPath)) {
         Write-Host "[错误] 脚本文件不存在: $realPath" -ForegroundColor Red
         return
@@ -697,22 +1490,28 @@ function Invoke-ScpmRemove {
     }
 
     $reg = Get-ScpmRegistryInternal
-    $targetName = if ($Name.EndsWith(".ps1", [System.StringComparison]::OrdinalIgnoreCase)) { $Name } else { "$Name.ps1" }
-
-    $toRemove = $null
-    $filePath = ""
-    foreach ($prop in $reg.scripts.PSObject.Properties) {
-        if ($prop.Name -eq $targetName -or $prop.Name -eq $Name) {
-            $toRemove = $prop.Name
-            $filePath = Resolve-PortablePathInternal $prop.Value.path
-            break
-        }
-    }
-
-    if ($null -eq $toRemove) {
-        Write-Host "[错误] 未在管理列表中找到: $Name" -ForegroundColor Red
+    if ($null -eq $reg.scripts -or $reg.scripts.PSObject.Properties.Count -eq 0) {
+        Write-Host "当前暂无受管理的脚本。" -ForegroundColor Yellow
         return
     }
+
+    $scriptProps = @($reg.scripts.PSObject.Properties)
+    $targetProp = $null
+
+    if ([string]::IsNullOrWhiteSpace($Name)) {
+        $targetProp = Select-ScpmScriptSingleInteractive "请选择要从清单移除的脚本" $scriptProps
+        if ($null -eq $targetProp) { return }
+    } else {
+        $matchedProps = Resolve-ScpmScriptPropsInternal $Name $scriptProps
+        if ($matchedProps.Count -eq 0) {
+            Write-Host "[错误] 未在管理列表中找到: $Name" -ForegroundColor Red
+            return
+        }
+        $targetProp = $matchedProps[0]
+    }
+
+    $toRemove = $targetProp.Name
+    $filePath = Resolve-PortablePathInternal $targetProp.Value.path
 
     $reg.scripts.PSObject.Properties.Remove($toRemove)
     Save-ScpmRegistryInternal $reg
@@ -925,37 +1724,178 @@ function Invoke-ScpmUpdate {
 # 主入口命令: scpm (别名 sm)
 # --------------------------------------------------------------------
 
-function scpm {
+function Invoke-ScpmHelp {
     [CmdletBinding()]
+    param([string]$Topic = "")
+
+    switch ($Topic) {
+        { $_ -in @("on", "enable") } {
+            Write-Host "`n用法: sm on [脚本名称/序号...]" -ForegroundColor Cyan
+            Write-Host "说明: 启用指定脚本的自启注入，并在当前终端会话立即生效。" -ForegroundColor White
+            Write-Host "示例:" -ForegroundColor Gray
+            Write-Host "  sm on               # 启动集中启停管理面板 (按空格键切换)" -ForegroundColor White
+            Write-Host "  sm on pxy           # 启用 pxy.ps1" -ForegroundColor White
+            Write-Host "  sm on 1 2           # 批量启用序号 1 和 2 的脚本" -ForegroundColor White
+            Write-Host "  sm on *             # 启用所有脚本" -ForegroundColor White
+            return
+        }
+        { $_ -in @("off", "disable") } {
+            Write-Host "`n用法: sm off [脚本名称/序号...]" -ForegroundColor Cyan
+            Write-Host "说明: 禁用指定脚本的自启注入 (新开终端将不再载入)。" -ForegroundColor White
+            Write-Host "示例:" -ForegroundColor Gray
+            Write-Host "  sm off              # 启动集中启停管理面板 (按空格键切换)" -ForegroundColor White
+            Write-Host "  sm off pxy          # 禁用 pxy.ps1" -ForegroundColor White
+            Write-Host "  sm off 2            # 禁用序号 2 的脚本" -ForegroundColor White
+            return
+        }
+        { $_ -in @("toggle", "switch", "manage", "t") } {
+            Write-Host "`n用法: sm toggle [脚本名称/序号...]" -ForegroundColor Cyan
+            Write-Host "说明: 集中管理脚本启停状态，或一键翻转目标脚本的启停。" -ForegroundColor White
+            Write-Host "示例:" -ForegroundColor Gray
+            Write-Host "  sm toggle           # 打开集中管理面板 (↑/↓ 移动光标，空格翻转启停，回车保存生效)" -ForegroundColor White
+            Write-Host "  sm toggle pxy       # 翻转 pxy.ps1 的启停状态" -ForegroundColor White
+            Write-Host "  sm toggle 1         # 翻转序号 1 脚本的启停状态" -ForegroundColor White
+            return
+        }
+        { $_ -in @("info", "show", "methods", "inspect", "detail") } {
+            Write-Host "`n用法: sm info [脚本名称/序号] [-All]" -ForegroundColor Cyan
+            Write-Host "说明: 查看脚本提供的具体方法、函数签名、参数选项及用法示例。" -ForegroundColor White
+            Write-Host "示例:" -ForegroundColor Gray
+            Write-Host "  sm info             # 交互式选择要查看方法的脚本" -ForegroundColor White
+            Write-Host "  sm info pxy         # 查看 pxy.ps1 导出的函数与用法" -ForegroundColor White
+            Write-Host "  sm info 1           # 查看序号 1 脚本的具体方法" -ForegroundColor White
+            Write-Host "  sm info -All        # 查看所有脚本提供的方法总览" -ForegroundColor White
+            return
+        }
+        { $_ -in @("list", "ls") } {
+            Write-Host "`n用法: sm list [-Detail]" -ForegroundColor Cyan
+            Write-Host "说明: 列出所有受管理的脚本、序号、启停状态、存储路径及提供的方法。" -ForegroundColor White
+            Write-Host "选项:" -ForegroundColor Gray
+            Write-Host "  -Detail, -d         # 显示完整的函数参数签名" -ForegroundColor White
+            return
+        }
+        default {
+            Write-Host "`n=== scpm (PowerShell Script Profile Manager) v$Script:ScpmVersion ===" -ForegroundColor Cyan
+            Write-Host "轻量、零依赖的 PowerShell 脚本与云同步管理器`n" -ForegroundColor White
+            Write-Host "常用命令 (别名: sm):" -ForegroundColor Green
+            Write-Host "  sm / sm ui / sm tui      # 打开全键盘交互式 TUI 管理控制台 (双区实时联动预览)" -ForegroundColor Yellow
+            Write-Host "  sm list / ls [-d]        # 查看受管理脚本清单及导出方法 (加 -d 查看函数签名)" -ForegroundColor White
+            Write-Host "  sm toggle / t [名称/序号]# 集中启停管理面板 (无参唤起，空格键交互翻转)" -ForegroundColor Yellow
+            Write-Host "  sm on [名称/序号]        # 启用脚本注入 (当前会话即时生效，无参唤起控制台)" -ForegroundColor White
+            Write-Host "  sm off [名称/序号]       # 禁用脚本注入 (无参唤起控制台)" -ForegroundColor White
+            Write-Host "  sm info [名称/序号]      # 查看脚本具体导出的函数、参数及用法示例" -ForegroundColor Cyan
+            Write-Host "  sm edit [名称/序号]      # 在编辑器中打开脚本 (无参交互选择)" -ForegroundColor White
+            Write-Host "  sm new <名称>            # 快速创建新脚本脚手架模板并打开" -ForegroundColor White
+            Write-Host "  sm add <路径>            # 收录现有本地脚本到存储库" -ForegroundColor White
+            Write-Host "  sm rm [名称/序号]        # 从管理清单移除脚本 (追加 -DeleteFile 删除物理文件)" -ForegroundColor White
+            Write-Host "  sm sync / refresh        # 同步存储库目录（如坚果云中新同步的文件）" -ForegroundColor White
+            Write-Host "  sm doctor / status       # 环境健康检查 (配置、路径、Profile 挂载)" -ForegroundColor White
+            Write-Host "  sm update / upgrade      # 从 GitHub 检查并一键更新 scpm" -ForegroundColor White
+            Write-Host "  sm -h / help [命令]      # 查看帮助说明 (或特定子命令帮助)" -ForegroundColor White
+            Write-Host "  sm -v / version          # 查看 scpm 当前版本" -ForegroundColor White
+            Write-Host "`n💡 交互式 TUI 快捷提示:" -ForegroundColor DarkGray
+            Write-Host "  • 直接运行 'sm' 或 'sm ui' 即可进入 TUI 控制台！" -ForegroundColor DarkGray
+            Write-Host "  • [↑/↓] 移动聚焦，下半区实时刷新该脚本导出的方法与文档" -ForegroundColor DarkGray
+            Write-Host "  • [空格] 原地秒切启用/禁用，[e] 打开编辑，[n] 新建，[s] 同步，[q] 退出" -ForegroundColor DarkGray
+            Write-Host ""
+        }
+    }
+}
+
+function scpm {
+    [CmdletBinding(DefaultParameterSetName = "Default")]
     param(
         [Parameter(Position = 0)]
-        [ValidateSet("init", "list", "ls", "enable", "on", "disable", "off", "add", "new", "edit", "remove", "rm", "sync", "refresh", "doctor", "status", "update", "upgrade", "version", "-v", "--version", "help", "-h", "--help", "")]
-        [string]$Subcommand = "list",
+        [string]$Subcommand,
 
         [Parameter(Position = 1, ValueFromRemainingArguments = $true)]
-        [string[]]$RemainingArgs
+        [string[]]$RemainingArgs,
+
+        [Alias("h", "?")]
+        [switch]$Help,
+
+        [Alias("v")]
+        [switch]$Version,
+
+        [Alias("d")]
+        [switch]$Detail
     )
+
+    $isHelp = $Help.IsPresent -or ($Subcommand -in @("help", "-h", "--help", "-?")) -or ($RemainingArgs -contains "-h") -or ($RemainingArgs -contains "--help")
+    $isVersion = $Version.IsPresent -or ($Subcommand -in @("version", "-v", "--version")) -or ($RemainingArgs -contains "-v") -or ($RemainingArgs -contains "--version")
+
+    if ($isVersion) {
+        Write-Host "scpm version v$Script:ScpmVersion" -ForegroundColor Cyan
+        return
+    }
+
+    if ($isHelp) {
+        $topic = ""
+        if ($Subcommand -notin @("help", "-h", "--help", "-?", "")) {
+            $topic = $Subcommand
+        } elseif ($null -ne $RemainingArgs -and $RemainingArgs.Count -gt 0) {
+            $topic = $RemainingArgs[0]
+        }
+        Invoke-ScpmHelp $topic
+        return
+    }
 
     switch ($Subcommand) {
         "init" {
             Invoke-ScpmInit @RemainingArgs
         }
-        { $_ -in @("list", "ls", "") } {
-            Invoke-ScpmList
+        { $_ -in @("ui", "tui") } {
+            Invoke-ScpmTui
+        }
+        { $_ -in @("list", "ls") } {
+            Invoke-ScpmList -Detail:$Detail
+        }
+        "" {
+            if ($Detail.IsPresent) {
+                Invoke-ScpmList -Detail:$true
+            } else {
+                $isInteractive = $false
+                try {
+                    if (-not [Console]::IsInputRedirected -and -not [Console]::IsOutputRedirected -and [Environment]::UserInteractive) {
+                        $null = $Host.UI.RawUI.CursorPosition
+                        $isInteractive = $true
+                    }
+                } catch { $isInteractive = $false }
+
+                if ($isInteractive) {
+                    Invoke-ScpmTui
+                } else {
+                    Invoke-ScpmList
+                }
+            }
+        }
+        { $_ -in @("toggle", "switch", "manage", "t") } {
+            if ($null -ne $RemainingArgs -and $RemainingArgs.Count -gt 0) {
+                Invoke-ScpmToggle @RemainingArgs
+            } else {
+                Invoke-ScpmTui
+            }
         }
         { $_ -in @("enable", "on") } {
-            if ($null -eq $RemainingArgs -or $RemainingArgs.Count -eq 0) {
-                Write-Host "用法: scpm enable <脚本名称...>" -ForegroundColor Yellow
-                return
+            if ($null -ne $RemainingArgs -and $RemainingArgs.Count -gt 0) {
+                Invoke-ScpmEnable @RemainingArgs
+            } else {
+                Invoke-ScpmTui
             }
-            Invoke-ScpmEnable @RemainingArgs
         }
         { $_ -in @("disable", "off") } {
-            if ($null -eq $RemainingArgs -or $RemainingArgs.Count -eq 0) {
-                Write-Host "用法: scpm disable <脚本名称...>" -ForegroundColor Yellow
-                return
+            if ($null -ne $RemainingArgs -and $RemainingArgs.Count -gt 0) {
+                Invoke-ScpmDisable @RemainingArgs
+            } else {
+                Invoke-ScpmTui
             }
-            Invoke-ScpmDisable @RemainingArgs
+        }
+        { $_ -in @("info", "show", "methods", "inspect", "detail") } {
+            if ($null -ne $RemainingArgs -and $RemainingArgs.Count -gt 0) {
+                Invoke-ScpmInfo @RemainingArgs
+            } else {
+                Invoke-ScpmInfo
+            }
         }
         "add" {
             if ($null -eq $RemainingArgs -or $RemainingArgs.Count -eq 0) {
@@ -972,18 +1912,18 @@ function scpm {
             Invoke-ScpmNew @RemainingArgs
         }
         "edit" {
-            if ($null -eq $RemainingArgs -or $RemainingArgs.Count -eq 0) {
-                Write-Host "用法: scpm edit <脚本名称>" -ForegroundColor Yellow
-                return
+            if ($null -ne $RemainingArgs -and $RemainingArgs.Count -gt 0) {
+                Invoke-ScpmEdit @RemainingArgs
+            } else {
+                Invoke-ScpmEdit
             }
-            Invoke-ScpmEdit @RemainingArgs
         }
         { $_ -in @("remove", "rm") } {
-            if ($null -eq $RemainingArgs -or $RemainingArgs.Count -eq 0) {
-                Write-Host "用法: scpm remove <脚本名称> [-DeleteFile]" -ForegroundColor Yellow
-                return
+            if ($null -ne $RemainingArgs -and $RemainingArgs.Count -gt 0) {
+                Invoke-ScpmRemove @RemainingArgs
+            } else {
+                Invoke-ScpmRemove
             }
-            Invoke-ScpmRemove @RemainingArgs
         }
         { $_ -in @("sync", "refresh") } {
             Invoke-ScpmSync
@@ -994,25 +1934,18 @@ function scpm {
         { $_ -in @("update", "upgrade") } {
             Invoke-ScpmUpdate @RemainingArgs
         }
-        { $_ -in @("version", "-v", "--version") } {
-            Write-Host "scpm version v$Script:ScpmVersion" -ForegroundColor Cyan
-        }
         default {
-            Write-Host "`n=== scpm (PowerShell Script Profile Manager) v$Script:ScpmVersion ===" -ForegroundColor Cyan
-            Write-Host "轻量、零依赖的 PowerShell 脚本与云同步管理器`n" -ForegroundColor White
-            Write-Host "常用命令 (别名: sm):" -ForegroundColor Green
-            Write-Host "  scpm init                # 初始化向导 (自动探测坚果云、配置 Profile)" -ForegroundColor White
-            Write-Host "  scpm list / ls           # 查看所有受管理脚本及启停状态" -ForegroundColor White
-            Write-Host "  scpm enable / on <名称>  # 启用脚本注入 (支持通配符)" -ForegroundColor White
-            Write-Host "  scpm disable / off <名称># 禁用脚本注入" -ForegroundColor White
-            Write-Host "  scpm add <路径>          # 添加现有脚本到存储库" -ForegroundColor White
-            Write-Host "  scpm new <名称>          # 创建新脚本模板并打开编辑器" -ForegroundColor White
-            Write-Host "  scpm edit <名称>         # 打开编辑脚本" -ForegroundColor White
-            Write-Host "  scpm remove / rm <名称>  # 从管理清单移除脚本" -ForegroundColor White
-            Write-Host "  scpm sync / refresh      # 同步存储库目录并刷新" -ForegroundColor White
-            Write-Host "  scpm doctor / status     # 检查配置、存储库与 Profile 挂载健康度" -ForegroundColor White
-            Write-Host "  scpm update / upgrade    # 检查并更新 scpm 至最新版本" -ForegroundColor White
-            Write-Host ""
+            # 如果输入的不是已知命令，检查是否是脚本名称或序号
+            $reg = Get-ScpmRegistryInternal
+            if ($null -ne $reg.scripts -and $reg.scripts.PSObject.Properties.Count -gt 0) {
+                $scriptProps = @($reg.scripts.PSObject.Properties)
+                $matched = Resolve-ScpmScriptPropsInternal $Subcommand $scriptProps
+                if ($matched.Count -gt 0) {
+                    Invoke-ScpmInfo $Subcommand
+                    return
+                }
+            }
+            Invoke-ScpmHelp $Subcommand
         }
     }
 }
@@ -1032,11 +1965,11 @@ try {
         $subcommand = if ($elements.Count -gt 1) { $elements[1].Extent.Text } else { "" }
 
         if ($elements.Count -eq 2 -and (-not $elements[1].Extent.Text.EndsWith(" "))) {
-            $subs = @("init", "list", "ls", "enable", "on", "disable", "off", "add", "new", "edit", "remove", "rm", "sync", "refresh", "doctor", "status", "update", "upgrade", "help")
+            $subs = @("init", "ui", "tui", "list", "ls", "toggle", "switch", "manage", "t", "enable", "on", "disable", "off", "info", "show", "methods", "inspect", "add", "new", "edit", "remove", "rm", "sync", "refresh", "doctor", "status", "update", "upgrade", "help", "version")
             $subs | Where-Object { $_ -like "$wordToComplete*" } | ForEach-Object {
                 [System.Management.Automation.CompletionResult]::new($_, $_, 'ParameterValue', $_)
             }
-        } elseif ($subcommand -in @("enable", "on", "disable", "off", "edit", "remove", "rm")) {
+        } elseif ($subcommand -in @("enable", "on", "disable", "off", "toggle", "t", "switch", "manage", "info", "show", "methods", "inspect", "edit", "remove", "rm")) {
             $reg = Get-ScpmRegistryInternal
             if ($null -ne $reg.scripts) {
                 $reg.scripts.PSObject.Properties | Where-Object { $_.Name -like "$wordToComplete*" } | ForEach-Object {
