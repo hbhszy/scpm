@@ -774,6 +774,7 @@ function Invoke-ScpmTui {
                 
                 $st = if ($it.Enabled) { "[✓ 已启用]" } else { "[✗ 已禁用]" }
                 $stColor = if ($it.Enabled) { "Green" } else { "DarkGray" }
+                $nameColor = if ($isCurrent) { "Cyan" } else { "White" }
 
                 $idxStr = "[$($it.Index)]".PadRight(5)
                 $nameStr = $it.Name.PadRight(22)
@@ -782,7 +783,7 @@ function Invoke-ScpmTui {
                 Write-Host $ptr -ForegroundColor $pColor -NoNewline
                 Write-Host $idxStr -ForegroundColor DarkGray -NoNewline
                 Write-Host " $st " -ForegroundColor $stColor -NoNewline
-                Write-Host $nameStr -ForegroundColor (if ($isCurrent) { "Cyan" } else { "White" }) -NoNewline
+                Write-Host $nameStr -ForegroundColor $nameColor -NoNewline
 
                 $usedLen = 3 + 5 + 10 + 22 + 2
                 $remLen = [Math]::Max(10, $winWidth - $usedLen)
