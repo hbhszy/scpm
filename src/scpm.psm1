@@ -89,15 +89,33 @@ function Resolve-PortablePathInternal([string]$portablePath) {
 function Get-ScpmDisplayWidthInternal([string]$str) {
     if ([string]::IsNullOrEmpty($str)) { return 0 }
     $w = 0
-    foreach ($ch in $str.ToCharArray()) {
+    $chars = $str.ToCharArray()
+    for ($i = 0; $i -lt $chars.Length; $i++) {
+        $ch = $chars[$i]
         $cp = [int]$ch
+
+        # Surrogate pair (UTF-16: e.g. 🔍 U+1F50D, 📖 U+1F4D6)
+        if ([char]::IsHighSurrogate($ch) -and ($i + 1 -lt $chars.Length) -and [char]::IsLowSurrogate($chars[$i + 1])) {
+            $codePoint = [char]::ConvertToUtf32($ch, $chars[$i + 1])
+            $i++
+            if (($codePoint -ge 0x1F000 -and $codePoint -le 0x1FAFF) -or
+                ($codePoint -ge 0x20000 -and $codePoint -le 0x2A6DF)) {
+                $w += 2
+            } else {
+                $w += 1
+            }
+            continue
+        }
+
+        # Wide characters & symbols
         if (($cp -ge 0x4E00 -and $cp -le 0x9FFF) -or
             ($cp -ge 0x3400 -and $cp -le 0x4DBF) -or
             ($cp -ge 0xF900 -and $cp -le 0xFAFF) -or
             ($cp -ge 0x3000 -and $cp -le 0x303F) -or
             ($cp -ge 0xFF01 -and $cp -le 0xFF60) -or
             ($cp -ge 0xFFE0 -and $cp -le 0xFFE6) -or
-            ($cp -ge 0x20000 -and $cp -le 0x2A6DF)) {
+            ($cp -ge 0x2600 -and $cp -le 0x27BF) -or
+            ($cp -ge 0x2B50 -and $cp -le 0x2B55)) {
             $w += 2
         } else {
             $w += 1
@@ -111,28 +129,66 @@ function Truncate-ScpmDisplayStringInternal([string]$str, [int]$maxWidth) {
     $dw = Get-ScpmDisplayWidthInternal $str
     if ($dw -le $maxWidth) { return $str }
     if ($maxWidth -le 3) {
-        $res = ""
+        $sb = [System.Text.StringBuilder]::new()
         $w = 0
-        foreach ($ch in $str.ToCharArray()) {
-            $cw = if ([int]$ch -gt 255) { 2 } else { 1 }
+        $chars = $str.ToCharArray()
+        for ($i = 0; $i -lt $chars.Length; $i++) {
+            $ch = $chars[$i]
+            $cw = 1
+            if ([char]::IsHighSurrogate($ch) -and ($i + 1 -lt $chars.Length) -and [char]::IsLowSurrogate($chars[$i + 1])) {
+                $codePoint = [char]::ConvertToUtf32($ch, $chars[$i + 1])
+                $cw = if (($codePoint -ge 0x1F000 -and $codePoint -le 0x1FAFF) -or ($codePoint -ge 0x20000 -and $codePoint -le 0x2A6DF)) { 2 } else { 1 }
+                if ($w + $cw -gt $maxWidth) { break }
+                [void]$sb.Append($ch)
+                [void]$sb.Append($chars[$i + 1])
+                $i++
+                $w += $cw
+                continue
+            }
+            $cp = [int]$ch
+            if (($cp -ge 0x4E00 -and $cp -le 0x9FFF) -or
+                ($cp -ge 0x3400 -and $cp -le 0x4DBF) -or
+                ($cp -ge 0xF900 -and $cp -le 0xFAFF) -or
+                ($cp -ge 0x3000 -and $cp -le 0x303F) -or
+                ($cp -ge 0xFF01 -and $cp -le 0xFF60) -or
+                ($cp -ge 0xFFE0 -and $cp -le 0xFFE6) -or
+                ($cp -ge 0x2600 -and $cp -le 0x27BF) -or
+                ($cp -ge 0x2B50 -and $cp -le 0x2B55)) { $cw = 2 }
             if ($w + $cw -gt $maxWidth) { break }
-            $res += $ch
+            [void]$sb.Append($ch)
             $w += $cw
         }
-        return $res
+        return $sb.ToString()
     }
     $targetWidth = $maxWidth - 3
     $curWidth = 0
     $sb = [System.Text.StringBuilder]::new()
-    foreach ($ch in $str.ToCharArray()) {
+    $chars = $str.ToCharArray()
+    for ($i = 0; $i -lt $chars.Length; $i++) {
+        $ch = $chars[$i]
+        $cw = 1
+        if ([char]::IsHighSurrogate($ch) -and ($i + 1 -lt $chars.Length) -and [char]::IsLowSurrogate($chars[$i + 1])) {
+            $codePoint = [char]::ConvertToUtf32($ch, $chars[$i + 1])
+            $cw = if (($codePoint -ge 0x1F000 -and $codePoint -le 0x1FAFF) -or ($codePoint -ge 0x20000 -and $codePoint -le 0x2A6DF)) { 2 } else { 1 }
+            if ($curWidth + $cw -gt $targetWidth) {
+                [void]$sb.Append("...")
+                return $sb.ToString()
+            }
+            [void]$sb.Append($ch)
+            [void]$sb.Append($chars[$i + 1])
+            $i++
+            $curWidth += $cw
+            continue
+        }
         $cp = [int]$ch
-        $cw = if (($cp -ge 0x4E00 -and $cp -le 0x9FFF) -or
+        if (($cp -ge 0x4E00 -and $cp -le 0x9FFF) -or
             ($cp -ge 0x3400 -and $cp -le 0x4DBF) -or
             ($cp -ge 0xF900 -and $cp -le 0xFAFF) -or
             ($cp -ge 0x3000 -and $cp -le 0x303F) -or
             ($cp -ge 0xFF01 -and $cp -le 0xFF60) -or
             ($cp -ge 0xFFE0 -and $cp -le 0xFFE6) -or
-            ($cp -ge 0x20000 -and $cp -le 0x2A6DF)) { 2 } else { 1 }
+            ($cp -ge 0x2600 -and $cp -le 0x27BF) -or
+            ($cp -ge 0x2B50 -and $cp -le 0x2B55)) { $cw = 2 }
         if ($curWidth + $cw -gt $targetWidth) {
             [void]$sb.Append("...")
             return $sb.ToString()
@@ -1175,22 +1231,27 @@ function Invoke-ScpmTui {
                 $lBadge = if (-not [string]::IsNullOrWhiteSpace($searchFilter)) { "[$($activeItems.Count)/$($items.Count)]" } else { "[$($items.Count)脚本]" }
                 $lTitleW = Get-ScpmDisplayWidthInternal $lTitle
                 $lBadgeW = Get-ScpmDisplayWidthInternal $lBadge
-                $lFillW = [Math]::Max(2, $leftW - (7 + $lTitleW + $lBadgeW))
+                # 左卡片顶边固定字符: "╭─ " (3) + " " (1) + " " (1) + " ─╮" (3) = 8
+                $lFillW = [Math]::Max(1, $leftW - (8 + $lTitleW + $lBadgeW))
 
                 $rTitle = if ($null -ne $currItem) { "⚡ 详情与方法: $($currItem.Name)" } else { "⚡ 详情预览" }
                 $rBadge = if ($null -ne $currItem) { if ($currItem.Enabled) { "[●已启用]" } else { "[○已禁用]" } } else { "[--]" }
                 $rTitleW = Get-ScpmDisplayWidthInternal $rTitle
                 $rBadgeW = Get-ScpmDisplayWidthInternal $rBadge
-                $rFillW = [Math]::Max(2, $rightW - (7 + $rTitleW + $rBadgeW))
+                # 右卡片顶边固定字符: "╭─ " (3) + " " (1) + " " (1) + " ─╮" (3) = 8
+                $rFillW = [Math]::Max(1, $rightW - (8 + $rTitleW + $rBadgeW))
 
-                # 左卡片顶边
+                # 左卡片顶边 (宽度严格等于 $leftW)
                 Out-Ansi "╭─ " -Fg "DarkCyan" -NoNewline
                 Out-Ansi $lTitle -Fg "Cyan" -NoNewline
                 Out-Ansi (" " + ("─" * $lFillW) + " ") -Fg "DarkCyan" -NoNewline
                 Out-Ansi $lBadge -Fg "Green" -NoNewline
-                Out-Ansi " ─╮ " -Fg "DarkCyan" -NoNewline
+                Out-Ansi " ─╮" -Fg "DarkCyan" -NoNewline
 
-                # 右卡片顶边
+                # 中间分隔符 (严格等于 1 列空格，与内容行、底边框保持同一列)
+                [Console]::Write(" ")
+
+                # 右卡片顶边 (宽度严格等于 $rightW)
                 Out-Ansi "╭─ " -Fg "DarkCyan" -NoNewline
                 Out-Ansi $rTitle -Fg "Yellow" -NoNewline
                 Out-Ansi (" " + ("─" * $rFillW) + " ") -Fg "DarkCyan" -NoNewline
@@ -1272,7 +1333,7 @@ function Invoke-ScpmTui {
                 $badge = if (-not [string]::IsNullOrWhiteSpace($searchFilter)) { "[ 匹配 $($activeItems.Count) / 共 $($items.Count) ]" } else { "[ $($items.Count) 脚本 | $enabledCount 启用 ]" }
                 $titleW = Get-ScpmDisplayWidthInternal $title
                 $badgeW = Get-ScpmDisplayWidthInternal $badge
-                $fillW = [Math]::Max(2, $cardWidth - (7 + $titleW + $badgeW))
+                $fillW = [Math]::Max(1, $cardWidth - (8 + $titleW + $badgeW))
 
                 Out-Ansi "╭─ " -Fg "DarkCyan" -NoNewline
                 Out-Ansi $title -Fg "Cyan" -NoNewline
@@ -1342,7 +1403,7 @@ function Invoke-ScpmTui {
                 if ($null -ne $currItem) {
                     $bTitle = "⚡ 实时方法与用法预览: $($currItem.Name)"
                     $bTitleW = Get-ScpmDisplayWidthInternal $bTitle
-                    $bFillW = [Math]::Max(2, $cardWidth - (4 + $bTitleW + 3))
+                    $bFillW = [Math]::Max(1, $cardWidth - (6 + $bTitleW))
 
                     Out-Ansi "╭─ " -Fg "DarkCyan" -NoNewline
                     Out-Ansi $bTitle -Fg "Yellow" -NoNewline
