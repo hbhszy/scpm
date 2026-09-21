@@ -147,8 +147,7 @@ function Detect-NutstoreCandidates {
     
     $potentialBases = @(
         (Join-Path $HOME "Nutstore\1\我的坚果云"),
-        (Join-Path $HOME "Nutstore\我的坚果云"),
-        "F:\我的坚果云"
+        (Join-Path $HOME "Nutstore\我的坚果云")
     )
 
     foreach ($b in $potentialBases) {
