@@ -114,7 +114,7 @@ function Get-ScpmDisplayWidthInternal([string]$str) {
             ($cp -ge 0x3000 -and $cp -le 0x303F) -or
             ($cp -ge 0xFF01 -and $cp -le 0xFF60) -or
             ($cp -ge 0xFFE0 -and $cp -le 0xFFE6) -or
-            ($cp -eq 0x26A1 -or $cp -eq 0x2699) -or
+            ($cp -eq 0x26A1) -or
             ($cp -ge 0x2B50 -and $cp -le 0x2B55)) {
             $w += 2
         } else {
@@ -152,7 +152,7 @@ function Truncate-ScpmDisplayStringInternal([string]$str, [int]$maxWidth) {
                 ($cp -ge 0x3000 -and $cp -le 0x303F) -or
                 ($cp -ge 0xFF01 -and $cp -le 0xFF60) -or
                 ($cp -ge 0xFFE0 -and $cp -le 0xFFE6) -or
-                ($cp -eq 0x26A1 -or $cp -eq 0x2699) -or
+                ($cp -eq 0x26A1) -or
                 ($cp -ge 0x2B50 -and $cp -le 0x2B55)) { $cw = 2 }
             if ($w + $cw -gt $maxWidth) { break }
             [void]$sb.Append($ch)
@@ -187,7 +187,7 @@ function Truncate-ScpmDisplayStringInternal([string]$str, [int]$maxWidth) {
             ($cp -ge 0x3000 -and $cp -le 0x303F) -or
             ($cp -ge 0xFF01 -and $cp -le 0xFF60) -or
             ($cp -ge 0xFFE0 -and $cp -le 0xFFE6) -or
-            ($cp -eq 0x26A1 -or $cp -eq 0x2699) -or
+            ($cp -eq 0x26A1) -or
             ($cp -ge 0x2B50 -and $cp -le 0x2B55)) { $cw = 2 }
         if ($curWidth + $cw -gt $targetWidth) {
             [void]$sb.Append("...")
