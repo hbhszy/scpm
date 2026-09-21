@@ -1,4 +1,4 @@
-@{
+﻿@{
     RootModule = 'scpm.psm1'
     ModuleVersion = '1.1.0'
     GUID = '8f3b612d-94c3-4d7a-b924-a7491cf0eb2a'
