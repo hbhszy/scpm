@@ -929,7 +929,7 @@ function scpm {
     [CmdletBinding()]
     param(
         [Parameter(Position = 0)]
-        [ValidateSet("init", "list", "ls", "enable", "on", "disable", "off", "add", "new", "edit", "remove", "rm", "sync", "refresh", "doctor", "status", "update", "upgrade", "help", "-h", "--help", "")]
+        [ValidateSet("init", "list", "ls", "enable", "on", "disable", "off", "add", "new", "edit", "remove", "rm", "sync", "refresh", "doctor", "status", "update", "upgrade", "version", "-v", "--version", "help", "-h", "--help", "")]
         [string]$Subcommand = "list",
 
         [Parameter(Position = 1, ValueFromRemainingArguments = $true)]
@@ -993,6 +993,9 @@ function scpm {
         }
         { $_ -in @("update", "upgrade") } {
             Invoke-ScpmUpdate @RemainingArgs
+        }
+        { $_ -in @("version", "-v", "--version") } {
+            Write-Host "scpm version v$Script:ScpmVersion" -ForegroundColor Cyan
         }
         default {
             Write-Host "`n=== scpm (PowerShell Script Profile Manager) v$Script:ScpmVersion ===" -ForegroundColor Cyan
