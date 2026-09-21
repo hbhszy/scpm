@@ -52,9 +52,10 @@
         $repoBase = "https://raw.githubusercontent.com/hbhszy/scpm/main/src"
         $wc = New-Object System.Net.WebClient
         $wc.Encoding = [System.Text.Encoding]::UTF8
+        $cacheBuster = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
         try {
-            $psm1Content = $wc.DownloadString("$repoBase/scpm.psm1")
-            $psd1Content = $wc.DownloadString("$repoBase/scpm.psd1")
+            $psm1Content = $wc.DownloadString("$repoBase/scpm.psm1?t=$cacheBuster")
+            $psd1Content = $wc.DownloadString("$repoBase/scpm.psd1?t=$cacheBuster")
         } catch {
             Write-Error "下载组件失败: $($_.Exception.Message)。 请检查网络连接。 "
             return

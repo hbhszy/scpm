@@ -878,7 +878,8 @@ function Invoke-ScpmUpdate {
         $wc = New-Object System.Net.WebClient
         $wc.Encoding = [System.Text.Encoding]::UTF8
         
-        $remotePsd1 = $wc.DownloadString($psd1Url)
+        $cacheBuster = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        $remotePsd1 = $wc.DownloadString("$psd1Url?t=$cacheBuster")
         $remoteVer = "1.0.1"
         if ($remotePsd1 -match "ModuleVersion\s*=\s*['""]([^'""]+)['""]") {
             $remoteVer = $matches[1]
@@ -892,7 +893,7 @@ function Invoke-ScpmUpdate {
         }
 
         Write-Host "正在下载更新组件..." -ForegroundColor Yellow
-        $remotePsm1 = $wc.DownloadString($psm1Url)
+        $remotePsm1 = $wc.DownloadString("$psm1Url?t=$cacheBuster")
 
         $utf8Bom = New-Object System.Text.UTF8Encoding($true)
         $targets = @(
