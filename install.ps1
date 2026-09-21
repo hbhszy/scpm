@@ -1,0 +1,95 @@
+﻿<#
+.SYNOPSIS
+    scpm (PowerShell Script Profile Manager) 一键安装与升级脚本
+
+.DESCRIPTION
+    支持远程一键安装 / 升级：
+    irm https://raw.githubusercontent.com/hbhszy/scpm/main/install.ps1 | iex
+
+    也支持从本地克隆仓库安装：
+    git clone https://github.com/hbhszy/scpm.git
+    cd scpm
+    .\install.ps1
+#>
+
+[CmdletBinding()]
+param(
+    [switch]$Force,
+    [switch]$NonInteractive
+)
+
+# 确保控制台编码为 UTF-8
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+} catch {}
+
+Write-Host ""
+Write-Host "==========================================================" -ForegroundColor Cyan
+Write-Host "   🚀 正在安装 / 升级 scpm (Script Profile Manager)       " -ForegroundColor Cyan
+Write-Host "==========================================================" -ForegroundColor Cyan
+Write-Host ""
+
+$scpmHome = Join-Path $HOME ".scpm"
+$ps7ModDir = Join-Path $HOME "Documents\PowerShell\Modules\scpm"
+$ps5ModDir = Join-Path $HOME "Documents\WindowsPowerShell\Modules\scpm"
+
+$targetDirs = @($scpmHome, $ps7ModDir, $ps5ModDir)
+foreach ($td in $targetDirs) {
+    if (-not (Test-Path -LiteralPath $td)) {
+        New-Item -ItemType Directory -Path $td -Force | Out-Null
+    }
+}
+
+$localSrc = if ($PSScriptRoot) { Join-Path $PSScriptRoot "src" } else { "" }
+$isLocal = ($localSrc -and (Test-Path -LiteralPath (Join-Path $localSrc "scpm.psm1")))
+
+$utf8Bom = New-Object System.Text.UTF8Encoding($true)
+
+if ($isLocal) {
+    Write-Host "[模式] 检测到本地源文件，正在安装..." -ForegroundColor Green
+    $psm1Content = [System.IO.File]::ReadAllText((Join-Path $localSrc "scpm.psm1"), [System.Text.Encoding]::UTF8)
+    $psd1Content = [System.IO.File]::ReadAllText((Join-Path $localSrc "scpm.psd1"), [System.Text.Encoding]::UTF8)
+} else {
+    Write-Host "[模式] 正在从 GitHub 官方仓库下载最新版..." -ForegroundColor Green
+    $repoBase = "https://raw.githubusercontent.com/hbhszy/scpm/main/src"
+    $wc = New-Object System.Net.WebClient
+    $wc.Encoding = [System.Text.Encoding]::UTF8
+    try {
+        $psm1Content = $wc.DownloadString("$repoBase/scpm.psm1")
+        $psd1Content = $wc.DownloadString("$repoBase/scpm.psd1")
+    } catch {
+        Write-Error "下载组件失败: $($_.Exception.Message)。请检查网络连接。"
+        return
+    }
+}
+
+# 复制到各模块路径
+foreach ($td in $targetDirs) {
+    [System.IO.File]::WriteAllText((Join-Path $td "scpm.psm1"), $psm1Content, $utf8Bom)
+    [System.IO.File]::WriteAllText((Join-Path $td "scpm.psd1"), $psd1Content, $utf8Bom)
+}
+
+Write-Host "  [✓] scpm 核心模块与元数据部署完成。" -ForegroundColor Green
+
+# 尝试导入模块并执行检查
+$scpmModule = Join-Path $scpmHome "scpm.psm1"
+Import-Module $scpmModule -Force -DisableNameChecking -ErrorAction SilentlyContinue
+
+$configFile = Join-Path $scpmHome "config.json"
+if (-not (Test-Path -LiteralPath $configFile)) {
+    Write-Host "\n检测到首次使用，将自动启动初始化向导..." -ForegroundColor Yellow
+    if (Get-Command scpm -ErrorAction SilentlyContinue) {
+        scpm init
+    }
+} else {
+    if (Get-Command scpm -ErrorAction SilentlyContinue) {
+        scpm sync | Out-Null
+    }
+    Write-Host "  [✓] 现有脚本 Loader 已自动刷新同步。" -ForegroundColor Green
+}
+
+Write-Host ""
+Write-Host "==========================================================" -ForegroundColor Green
+Write-Host "   🎉 scpm 安装完成！输入 sm help 或 sm ls 即可体验。     " -ForegroundColor Green
+Write-Host "==========================================================" -ForegroundColor Green
+Write-Host ""

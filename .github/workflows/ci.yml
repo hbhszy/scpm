@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Test Module Load on PowerShell 7
+        shell: pwsh
+        run: |
+          Import-Module ./src/scpm.psd1 -Force
+          Get-Command scpm, sm
+          sm help
+          
+      - name: Test Module Load on Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          Import-Module ./src/scpm.psd1 -Force
+          Get-Command scpm, sm
+          sm help
