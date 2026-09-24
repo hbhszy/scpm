@@ -217,11 +217,11 @@ function Update-ScpmLoaderInternal {
     [void]$sb.AppendLine("# ====================================================================")
     [void]$sb.AppendLine("")
     [void]$sb.AppendLine("# Ensure scpm CLI is always available")
-    [void]$sb.AppendLine("if (-not (Get-Command scpm -ErrorAction SilentlyContinue)) {")
-    [void]$sb.AppendLine("    `$__scpmPsm1 = Join-Path `$HOME '.scpm\scpm.psm1'")
-    [void]$sb.AppendLine("    if (Test-Path -LiteralPath `$__scpmPsm1) {")
-    [void]$sb.AppendLine("        Import-Module `$__scpmPsm1 -DisableNameChecking -ErrorAction SilentlyContinue")
-    [void]$sb.AppendLine("    }")
+    # Get-Command can auto-load a stale copy from PSModulePath. Import the
+    # canonical copy directly so the profile always uses the current module.
+    [void]$sb.AppendLine("`$__scpmPsm1 = Join-Path `$HOME '.scpm\scpm.psm1'")
+    [void]$sb.AppendLine("if (Test-Path -LiteralPath `$__scpmPsm1) {")
+    [void]$sb.AppendLine("    Import-Module `$__scpmPsm1 -Force -DisableNameChecking -ErrorAction SilentlyContinue")
     [void]$sb.AppendLine("}")
     [void]$sb.AppendLine("")
 
@@ -890,6 +890,14 @@ function Invoke-ScpmTui {
 
     $reset = "$esc[0m"
 
+    # Console.Write uses Console.OutputEncoding. A legacy code page can replace
+    # symbols and emoji with '?' even when Chinese text remains readable.
+    $savedOutputEncoding = $null
+    try {
+        $savedOutputEncoding = [Console]::OutputEncoding
+        [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+    } catch {}
+
     function Out-Ansi {
         param(
             [string]$Text = "",
@@ -909,11 +917,11 @@ function Invoke-ScpmTui {
     # 启用备用屏幕缓冲区 (Alternate Screen Buffer) 并隐藏光标
     # 彻底隔离终端历史滚动，防止任何画面残影和上下漂移
     try {
-        [Console]::Write("$esc[?1049h$esc[?25l")
-    } catch {}
-    Clear-Host
+        try {
+            [Console]::Write("$esc[?1049h$esc[?25l")
+        } catch {}
+        Clear-Host
 
-    try {
         while ($true) {
             # 过滤逻辑 (按 / 搜索过滤)
             if ([string]::IsNullOrWhiteSpace($searchFilter)) {
@@ -1065,7 +1073,7 @@ function Invoke-ScpmTui {
                         $it = $activeItems[$i]
                         $isCurrent = ($i -eq $cursor)
 
-                        $ptr = if ($isCurrent) { " ❯ " } else { "   " }
+                        $ptr = if ($isCurrent) { " > " } else { "   " }
                         $idxStr = "[$($it.Index)] "
                         $stStr = if ($it.Enabled) { "[●] " } else { "[○] " }
                         
@@ -1134,7 +1142,7 @@ function Invoke-ScpmTui {
                     $rightRows.Add([PSCustomObject]@{
                         Type = 'Segments'
                         Segments = @(
-                            @{ Text = "⚙ 导出方法 / 全局函数 ($($mInfo.Functions.Count)):"; Fg = "Cyan" }
+                            @{ Text = "导出方法 / 全局函数 ($($mInfo.Functions.Count)):"; Fg = "Cyan" }
                         )
                     })
 
@@ -1142,7 +1150,7 @@ function Invoke-ScpmTui {
                         $rightRows.Add([PSCustomObject]@{
                             Type = 'Segments'
                             Segments = @(
-                                @{ Text = "  • (该脚本未定义全局函数，作为独立脚本直接执行)"; Fg = "DarkGray" }
+                                @{ Text = "  - (该脚本未定义全局函数，作为独立脚本直接执行)"; Fg = "DarkGray" }
                             )
                         })
                     } else {
@@ -1151,7 +1159,7 @@ function Invoke-ScpmTui {
                             $rightRows.Add([PSCustomObject]@{
                                 Type = 'Segments'
                                 Segments = @(
-                                    @{ Text = "  • "; Fg = "Cyan" },
+                                    @{ Text = "  - "; Fg = "Cyan" },
                                     @{ Text = (Truncate-ScpmDisplayStringInternal $fn.Signature ($rightInner - 6)); Fg = "White" }
                                 )
                             })
@@ -1178,7 +1186,7 @@ function Invoke-ScpmTui {
                         $rightRows.Add([PSCustomObject]@{
                             Type = 'Segments'
                             Segments = @(
-                                @{ Text = "📖 用法示例 (USAGE):"; Fg = "Cyan" }
+                                @{ Text = "用法示例 (USAGE):"; Fg = "Cyan" }
                             )
                         })
                         $uLines = $mInfo.Usage -split '\r?\n'
@@ -1197,7 +1205,7 @@ function Invoke-ScpmTui {
                         $rightRows.Add([PSCustomObject]@{
                             Type = 'Segments'
                             Segments = @(
-                                @{ Text = "📖 详细说明:"; Fg = "Cyan" }
+                                @{ Text = "详细说明:"; Fg = "Cyan" }
                             )
                         })
                         $dLines = $mInfo.Description -split '\r?\n'
@@ -1227,14 +1235,14 @@ function Invoke-ScpmTui {
                 }
 
                 # --- 3. 渲染左右顶边框 ---
-                $lTitle = if (-not [string]::IsNullOrWhiteSpace($searchFilter)) { "🔍 搜索: `"$searchFilter`"" } else { "受管理脚本列表" }
+                $lTitle = if (-not [string]::IsNullOrWhiteSpace($searchFilter)) { "搜索: `"$searchFilter`"" } else { "受管理脚本列表" }
                 $lBadge = if (-not [string]::IsNullOrWhiteSpace($searchFilter)) { "[$($activeItems.Count)/$($items.Count)]" } else { "[$($items.Count)脚本]" }
                 $lTitleW = Get-ScpmDisplayWidthInternal $lTitle
                 $lBadgeW = Get-ScpmDisplayWidthInternal $lBadge
                 # 左卡片顶边固定字符: "╭─ " (3) + " " (1) + " " (1) + " ─╮" (3) = 8
                 $lFillW = [Math]::Max(1, $leftW - (8 + $lTitleW + $lBadgeW))
 
-                $rTitle = if ($null -ne $currItem) { "⚡ 详情与方法: $($currItem.Name)" } else { "⚡ 详情预览" }
+                $rTitle = if ($null -ne $currItem) { "详情与方法: $($currItem.Name)" } else { "详情预览" }
                 $rBadge = if ($null -ne $currItem) { if ($currItem.Enabled) { "[●已启用]" } else { "[○已禁用]" } } else { "[--]" }
                 $rTitleW = Get-ScpmDisplayWidthInternal $rTitle
                 $rBadgeW = Get-ScpmDisplayWidthInternal $rBadge
@@ -1329,7 +1337,7 @@ function Invoke-ScpmTui {
                 }
 
                 # 上卡片 [脚本列表]
-                $title = if (-not [string]::IsNullOrWhiteSpace($searchFilter)) { "🔍 搜索: `"$searchFilter`"" } else { "[scpm] 脚本集中管理控制台 v$Script:ScpmVersion" }
+                $title = if (-not [string]::IsNullOrWhiteSpace($searchFilter)) { "搜索: `"$searchFilter`"" } else { "[scpm] 脚本集中管理控制台 v$Script:ScpmVersion" }
                 $badge = if (-not [string]::IsNullOrWhiteSpace($searchFilter)) { "[ 匹配 $($activeItems.Count) / 共 $($items.Count) ]" } else { "[ $($items.Count) 脚本 | $enabledCount 启用 ]" }
                 $titleW = Get-ScpmDisplayWidthInternal $title
                 $badgeW = Get-ScpmDisplayWidthInternal $badge
@@ -1365,7 +1373,7 @@ function Invoke-ScpmTui {
                         $it = $activeItems[$i]
                         $isCurrent = ($i -eq $cursor)
 
-                        $ptr = if ($isCurrent) { " ❯ " } else { "   " }
+                        $ptr = if ($isCurrent) { " > " } else { "   " }
                         $idxStr = "[$($it.Index)] "
                         $st = if ($it.Enabled) { "[● 已启用] " } else { "[○ 已禁用] " }
                         $stColor = if ($it.Enabled) { "Green" } else { "DarkGray" }
@@ -1401,7 +1409,7 @@ function Invoke-ScpmTui {
 
                 # 下卡片 [方法与文档联动预览]
                 if ($null -ne $currItem) {
-                    $bTitle = "⚡ 实时方法与用法预览: $($currItem.Name)"
+                    $bTitle = "实时方法与用法预览: $($currItem.Name)"
                     $bTitleW = Get-ScpmDisplayWidthInternal $bTitle
                     $bFillW = [Math]::Max(1, $cardWidth - (6 + $bTitleW))
 
@@ -1416,16 +1424,16 @@ function Invoke-ScpmTui {
                         @{ Text = $currItem.Path; Color = "Gray" }
                     )
 
-                    Out-CardInnerLine "⚙ 导出方法 / 全局函数:" "Cyan"
+                    Out-CardInnerLine "导出方法 / 全局函数:" "Cyan"
                     if ($currMethodInfo.Functions.Count -eq 0) {
-                        Out-CardInnerLine "  • (该脚本未定义全局函数，作为独立脚本直接执行)" "DarkGray"
+                        Out-CardInnerLine "  - (该脚本未定义全局函数，作为独立脚本直接执行)" "DarkGray"
                     } else {
                         $shownFuncCount = 0
                         foreach ($fn in $currMethodInfo.Functions) {
                             if ($ctx.lines -ge ($maxLines - 4)) { break }
                             if (-not $fn.IsNested -and $shownFuncCount -lt 3) {
                                 Out-CardMultiLine @(
-                                    @{ Text = "  • "; Color = "Cyan" },
+                                    @{ Text = "  - "; Color = "Cyan" },
                                     @{ Text = $fn.Signature; Color = "White" }
                                 )
                                 if ($fn.Parameters.Count -gt 0) {
@@ -1448,7 +1456,7 @@ function Invoke-ScpmTui {
                     }
 
                     if (-not [string]::IsNullOrWhiteSpace($currMethodInfo.Usage) -and ($ctx.lines -lt ($maxLines - 4))) {
-                        Out-CardInnerLine "📖 用法说明 (USAGE):" "Cyan"
+                        Out-CardInnerLine "用法说明 (USAGE):" "Cyan"
                         $uLines = $currMethodInfo.Usage -split '\r?\n'
                         $shownUsage = 0
                         foreach ($ul in $uLines) {
@@ -1487,7 +1495,7 @@ function Invoke-ScpmTui {
             [Console]::Write("$esc[K`n")
 
             if ($inSearchMode) {
-                Out-Ansi " 🔍 搜索: " -Fg "Yellow" -NoNewline
+                Out-Ansi " 搜索: " -Fg "Yellow" -NoNewline
                 Out-Ansi "$searchFilter" -Fg "White" -NoNewline
                 Out-Ansi "█" -Fg "Yellow" -NoNewline
                 Out-Ansi " (回车锁定，Esc退出，↑/↓选择，空格启停)" -Fg "DarkGray" -NoNewline
@@ -1573,15 +1581,15 @@ function Invoke-ScpmTui {
                                 if (Test-Path -LiteralPath $currItem.RealPath) {
                                     try {
                                         & { . $currItem.RealPath } *>$null
-                                        $statusMsg = "[✓] 已启用 $($currItem.Name)！"
+                                        $statusMsg = "[+] 已启用 $($currItem.Name)！"
                                         $statusMsgColor = "Green"
                                     } catch {
-                                        $statusMsg = "[✓] 已启用 $($currItem.Name) (载入告警)"
+                                        $statusMsg = "[+] 已启用 $($currItem.Name) (载入告警)"
                                         $statusMsgColor = "Yellow"
                                     }
                                 }
                             } else {
-                                $statusMsg = "[✗] 已禁用 $($currItem.Name)。"
+                                $statusMsg = "[-] 已禁用 $($currItem.Name)。"
                                 $statusMsgColor = "Yellow"
                             }
                         }
@@ -1636,15 +1644,15 @@ function Invoke-ScpmTui {
                             if (Test-Path -LiteralPath $currItem.RealPath) {
                                 try {
                                     & { . $currItem.RealPath } *>$null
-                                    $statusMsg = "[✓] 已启用 $($currItem.Name) 并即时载入当前终端！"
+                                    $statusMsg = "[+] 已启用 $($currItem.Name) 并即时载入当前终端！"
                                     $statusMsgColor = "Green"
                                 } catch {
-                                    $statusMsg = "[✓] 已启用 $($currItem.Name) (载入告警: $($_.Exception.Message))"
+                                    $statusMsg = "[+] 已启用 $($currItem.Name) (载入告警: $($_.Exception.Message))"
                                     $statusMsgColor = "Yellow"
                                 }
                             }
                         } else {
-                            $statusMsg = "[✗] 已禁用 $($currItem.Name) (新开终端将不再载入)。"
+                            $statusMsg = "[-] 已禁用 $($currItem.Name) (新开终端将不再载入)。"
                             $statusMsgColor = "Yellow"
                         }
                     }
@@ -1689,7 +1697,7 @@ function Invoke-ScpmTui {
                             $reg = $data.Registry
                             $cursor = $items.Count - 1
                             $searchFilter = ""
-                            $statusMsg = "[✓] 成功创建新脚本: $newName！"
+                            $statusMsg = "[+] 成功创建新脚本: $newName！"
                             $statusMsgColor = "Green"
                         }
                         [Console]::Write("$esc[?25l$esc[2J$esc[1;1H")
@@ -1699,13 +1707,13 @@ function Invoke-ScpmTui {
                         $items = $data.Items
                         $reg = $data.Registry
                         if ($syncRes.Added -gt 0) {
-                            $statusMsg = "[✓] 存储库同步完成: 发现并收录 $($syncRes.Added) 个新脚本 ($($syncRes.NewScripts -join ', '))！"
+                            $statusMsg = "[+] 存储库同步完成: 发现并收录 $($syncRes.Added) 个新脚本 ($($syncRes.NewScripts -join ', '))！"
                             $statusMsgColor = "Green"
                         } elseif ($syncRes.Missing -gt 0) {
                             $statusMsg = "[!] 存储库同步告警: 检测到 $($syncRes.Missing) 个脚本文件缺失！"
                             $statusMsgColor = "Yellow"
                         } else {
-                            $statusMsg = "[✓] 存储库同步完毕：所有脚本均已是最新的 (共 $($items.Count) 个)。"
+                            $statusMsg = "[+] 存储库同步完毕：所有脚本均已是最新的 (共 $($items.Count) 个)。"
                             $statusMsgColor = "Green"
                         }
                     } elseif ($ch -in @("r", "R") -or $key.Key -eq [ConsoleKey]::Delete) {
@@ -1720,7 +1728,7 @@ function Invoke-ScpmTui {
                                 $items = $data.Items
                                 $reg = $data.Registry
                                 if ($cursor -ge $items.Count) { $cursor = [Math]::Max(0, $items.Count - 1) }
-                                $statusMsg = "[✓] 已注销脚本: $($it.Name)。"
+                                $statusMsg = "[+] 已注销脚本: $($it.Name)。"
                                 $statusMsgColor = "Yellow"
                             }
                             [Console]::Write("$esc[?25l$esc[2J$esc[1;1H")
@@ -1735,7 +1743,7 @@ function Invoke-ScpmTui {
                         }
                         Save-ScpmRegistryInternal $reg
                         Update-ScpmLoaderInternal | Out-Null
-                        $statusMsg = "[✓] 已全部启用并即时注入当前会话！"
+                        $statusMsg = "[+] 已全部启用并即时注入当前会话！"
                         $statusMsgColor = "Green"
                     } elseif ($ch -in @("d", "D")) {
                         foreach ($it in $activeItems) {
@@ -1744,7 +1752,7 @@ function Invoke-ScpmTui {
                         }
                         Save-ScpmRegistryInternal $reg
                         Update-ScpmLoaderInternal | Out-Null
-                        $statusMsg = "[✗] 已全部禁用。"
+                        $statusMsg = "[-] 已全部禁用。"
                         $statusMsgColor = "Yellow"
                     } elseif ($ch -in @("k", "K")) {
                         if ($activeItems.Count -gt 0) {
@@ -1779,6 +1787,9 @@ function Invoke-ScpmTui {
             [Console]::Write("$esc[?25h$esc[?1049l")
             [Console]::CursorVisible = $savedCursorVisible
         } catch {}
+        if ($null -ne $savedOutputEncoding) {
+            try { [Console]::OutputEncoding = $savedOutputEncoding } catch {}
+        }
         Write-Host "`n[scpm] 已退出控制台。" -ForegroundColor Gray
     }
 }
